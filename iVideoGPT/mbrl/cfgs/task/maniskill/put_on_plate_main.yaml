@@ -1,0 +1,12 @@
+defaults:
+  - _self_
+
+task_name: PutOnPlateInScene25Main-v3
+frame_stack: 3
+action_repeat: 2
+max_episode_steps: 80
+num_train_frames: 100002
+num_seed_frames: 4000
+eval_every_frames: 5000
+num_eval_episodes: 10
+stddev_schedule: 'linear(1.0,0.2,100000)'

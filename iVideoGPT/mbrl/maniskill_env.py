@@ -10,9 +10,11 @@ import cv2
 import numpy as np
 
 import dm_env
+import gymnasium as gym
 from dm_env import StepType, specs
 import torch
 from omegaconf import OmegaConf
+import mani_skill.envs  # noqa: F401
 
 from metaworld_env import (
     ActionDTypeWrapper,
@@ -25,6 +27,8 @@ from rlinf.envs.maniskill.maniskill_env import ManiskillEnv as RLinfManiskillEnv
 os.environ.setdefault("SAPIEN_LOG_LEVEL", "error")
 logger = logging.getLogger(__name__)
 logging.getLogger("mani_skill").setLevel(logging.ERROR)
+
+RLINF_TASK_PREFIXES = ("PutOn", "PutCarrot")
 
 
 class ManiSkillTimeStep(NamedTuple):
@@ -56,6 +60,10 @@ def _to_numpy(x):
     return x
 
 
+def _use_rlinf_backend(task_name: str) -> bool:
+    return any(task_name.startswith(prefix) for prefix in RLINF_TASK_PREFIXES)
+
+
 class ManiSkill(dm_env.Environment):
     """Single-task ManiSkill environment with a dm_env interface."""
 
@@ -73,8 +81,11 @@ class ManiSkill(dm_env.Environment):
         obj_set: str = "train",
         render_mode: str = "all",
         shader_pack: str = "default",
+        render_backend: str | None = "gpu",
         size: tuple[int, int] = (64, 64),
+        use_rlinf: bool = True,
     ):
+        self._use_rlinf = use_rlinf
         cfg = OmegaConf.create(
             {
                 "auto_reset": False,
@@ -99,15 +110,30 @@ class ManiSkill(dm_env.Environment):
                     "max_episode_steps": max_episode_steps,
                     "sensor_configs": {"shader_pack": shader_pack},
                     "render_mode": render_mode,
-                    "obj_set": obj_set,
+                    "render_backend": render_backend,
                 },
             }
         )
+        if obj_set is not None:
+            cfg.init_params["obj_set"] = obj_set
 
-        self._env = RLinfManiskillEnv(
-            cfg, seed_offset=0, total_num_processes=1, record_metrics=True
-        )
-        self._env.is_start = False
+        if self._use_rlinf:
+            self._env = RLinfManiskillEnv(
+                cfg, seed_offset=0, total_num_processes=1, record_metrics=True
+            )
+            self._env.is_start = False
+            action_space = self._env.env.action_space
+        else:
+            env_kwargs = {
+                "num_envs": 1,
+                "obs_mode": obs_mode,
+                "control_mode": control_mode,
+                "render_mode": render_mode,
+                "sim_backend": sim_backend,
+            }
+            env_kwargs = {k: v for k, v in env_kwargs.items() if v is not None}
+            self._env = gym.make(task_name, **env_kwargs)
+            action_space = self._env.action_space
 
         self._seed = seed
         self._reset_seed = seed
@@ -117,7 +143,6 @@ class ManiSkill(dm_env.Environment):
         self._last_obs = None
         self._size = size
 
-        action_space = self._env.env.action_space
         self._batched_action = len(action_space.shape) == 2
         if self._batched_action:
             low = action_space.low[0]
@@ -143,9 +168,25 @@ class ManiSkill(dm_env.Environment):
         return action
 
     def _extract_image(self, obs) -> np.ndarray:
-        frame = obs["images"][0]
-        frame = _to_numpy(frame).astype(np.uint8)
-        frame = np.transpose(frame, (1, 2, 0))
+        if self._use_rlinf:
+            frame = obs["images"][0]
+            frame = _to_numpy(frame)
+            if frame.ndim == 3:
+                frame = np.transpose(frame, (1, 2, 0))
+            else:
+                frame = np.transpose(frame, (1, 2, 0))
+        else:
+            sensor_data = obs.get("sensor_data", {})
+            camera = sensor_data.get("base_camera")
+            if camera is None and sensor_data:
+                camera = next(iter(sensor_data.values()))
+            if camera is None:
+                raise KeyError("No camera image found in ManiSkill observation.")
+            frame = camera["rgb"]
+            frame = _to_numpy(frame)
+            if frame.ndim == 4:
+                frame = frame[0]
+        frame = frame.astype(np.uint8)
         frame = cv2.resize(frame, (self._size[1], self._size[0]))
         return frame
 
@@ -170,10 +211,15 @@ class ManiSkill(dm_env.Environment):
     def action_spec(self):
         return self._action_spec
 
-    def reset(self):
-        raw_obs, infos = self._env.reset(seed=self._reset_seed)
+    def reset(self, seed=None):
+        if seed is not None:
+            self._reset_seed = seed
+        if self._use_rlinf:
+            raw_obs, infos = self._env.reset(seed=self._reset_seed)
+            self._env.is_start = False
+        else:
+            raw_obs, infos = self._env.reset(seed=self._reset_seed)
         self._reset_seed = None
-        self._env.is_start = False
         image = self._extract_image(raw_obs)
         self._last_obs = image
         self._done = False
@@ -196,9 +242,12 @@ class ManiSkill(dm_env.Environment):
 
         for _ in range(self._action_repeat):
             env_action = self._format_action(action)
-            obs, reward, terminations, truncations, infos = self._env.step(
-                env_action, auto_reset=False
-            )
+            if self._use_rlinf:
+                obs, reward, terminations, truncations, infos = self._env.step(
+                    env_action, auto_reset=False
+                )
+            else:
+                obs, reward, terminations, truncations, infos = self._env.step(env_action)
             if reward is None:
                 reward_value = 0.0
             else:
@@ -254,9 +303,12 @@ def make(
     obj_set,
     render_mode,
     shader_pack,
+    render_backend,
     size=(64, 64),
 ):
-    def _build_env(backend):
+    use_rlinf = _use_rlinf_backend(name)
+
+    def _build_env(backend, render_backend_override=None):
         return ManiSkill(
             name,
             seed=seed,
@@ -264,6 +316,7 @@ def make(
             obs_mode=obs_mode,
             control_mode=control_mode,
             sim_backend=backend,
+            render_backend=render_backend_override or render_backend,
             sim_freq=sim_freq,
             control_freq=control_freq,
             max_episode_steps=max_episode_steps,
@@ -271,15 +324,23 @@ def make(
             render_mode=render_mode,
             shader_pack=shader_pack,
             size=size,
+            use_rlinf=use_rlinf,
         )
 
     try:
         env = _build_env(sim_backend)
     except RuntimeError as err:
-        msg = str(err)
-        if "PhysxGpuSystem" in msg or "CUDA failed" in msg:
-            logger.info("Falling back to PhysX CPU backend due to GPU init failure.")
-            env = _build_env("physx_cpu")
+        msg = str(err).lower()
+        if (
+            "physxgpusystem" in msg
+            or "cuda failed" in msg
+            or "sapien-vulkan" in msg
+            or "vulkan" in msg
+        ):
+            logger.info(
+                "Falling back to PhysX CPU + CPU renderer due to GPU/Vulkan init failure."
+            )
+            env = _build_env("physx_cpu", render_backend_override="sapien_cpu")
         else:
             raise
     env = ActionDTypeWrapper(env, np.float32)

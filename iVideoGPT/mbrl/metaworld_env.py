@@ -83,8 +83,8 @@ class ActionScaleWrapper(dm_env.Environment):
     def step(self, action):
         return self._env.step(self._transform(action))
 
-    def reset(self):
-        return self._env.reset()
+    def reset(self, **kwargs):
+        return self._env.reset(**kwargs)
 
     def observation_spec(self):
         return self._env.observation_spec()
@@ -153,8 +153,8 @@ class FrameStackWrapper(dm_env.Environment):
             pixels = pixels[0]
         return pixels.transpose(2, 0, 1).copy()
 
-    def reset(self):
-        time_step = self._env.reset()
+    def reset(self, **kwargs):
+        time_step = self._env.reset(**kwargs)
         pixels = self._extract_pixels(time_step)
         for _ in range(self._num_frames):
             self._frames.append(pixels)
@@ -196,8 +196,8 @@ class ActionDTypeWrapper(dm_env.Environment):
     def action_spec(self):
         return self._action_spec
 
-    def reset(self):
-        return self._env.reset()
+    def reset(self, **kwargs):
+        return self._env.reset(**kwargs)
 
     def __getattr__(self, name):
         return getattr(self._env, name)
@@ -207,8 +207,8 @@ class ExtendedTimeStepWrapper(dm_env.Environment):
     def __init__(self, env):
         self._env = env
 
-    def reset(self):
-        time_step = self._env.reset()
+    def reset(self, **kwargs):
+        time_step = self._env.reset(**kwargs)
         return self._augment_time_step(time_step)
 
     def step(self, action):

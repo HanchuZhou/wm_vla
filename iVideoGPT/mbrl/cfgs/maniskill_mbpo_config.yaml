@@ -1,17 +1,19 @@
 defaults:
   - _self_
-  - task@_global_: maniskill/put_on_plate_main
+  - task: maniskill/put_on_plate_main
   - override hydra/launcher: submitit_local
 
 # task settings
-frame_stack: 3
-action_repeat: 2
+task_name: ${task.task_name}
+frame_stack: ${task.frame_stack}
+action_repeat: ${task.action_repeat}
 discount: 0.99
 # train settings
-num_seed_frames: 4000
+num_train_frames: ${task.num_train_frames}
+num_seed_frames: ${task.num_seed_frames}
 # eval
-eval_every_frames: 20000
-num_eval_episodes: 20
+eval_every_frames: ${task.eval_every_frames}
+num_eval_episodes: ${task.num_eval_episodes}
 # snapshot
 save_snapshot: true
 # replay buffer
@@ -19,7 +21,7 @@ replay_buffer_size: 1000000
 replay_buffer_num_workers: 1
 nstep: 3
 batch_size: 256
-demo_path_prefix: /home/darling/iVideoGPT/mbrl/demonstrations
+demo_path_prefix: /home/darling/wm_vla/iVideoGPT/mbrl/demonstrations # TODO: make it relative path
 demo: false
 
 # misc
@@ -28,6 +30,8 @@ device: cuda
 save_video: true
 save_train_video: false
 use_tb: true
+max_gifs_per_type: 3
+max_eval_videos: 3
 # experiment
 experiment: exp
 exp_name: maniskill_mbpo
@@ -37,15 +41,18 @@ feature_dim: 50
 
 # maniskill settings
 obs_mode: rgb+segmentation
-control_mode: null
+control_mode: ${task.control_mode}
 sim_backend: gpu
 sim_freq: 500
 control_freq: 5
-max_episode_steps: 80
-obj_set: train
+max_episode_steps: ${task.max_episode_steps}
+obj_set: ${task.obj_set}
 render_mode: all
 shader_pack: default
+render_backend: gpu
 agent_update_times: 2
+
+stddev_schedule: ${task.stddev_schedule}
 
 agent:
   _target_: drqv2.DrQV2Agent

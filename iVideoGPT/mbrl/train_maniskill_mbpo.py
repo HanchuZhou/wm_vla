@@ -48,6 +48,8 @@ class Workspace:
         print(f'workspace: {self.work_dir}')
 
         self.cfg = cfg
+        self.max_gifs_per_type = getattr(cfg, 'max_gifs_per_type', 3)
+        self.max_eval_videos = getattr(cfg, 'max_eval_videos', 3)
         drq_utils.set_seed_everywhere(cfg.seed)
         self.device = torch.device(cfg.device)
         self.setup()
@@ -61,6 +63,7 @@ class Workspace:
         self.timer = drq_utils.Timer()
         self._global_step = 0
         self._global_episode = 0
+        self._global_imag_step = 0
 
     def setup(self):
         # create logger
@@ -80,6 +83,7 @@ class Workspace:
             self.cfg.obj_set,
             self.cfg.render_mode,
             self.cfg.shader_pack,
+            self.cfg.render_backend,
         )
         self.eval_env = maniskill_env.make(
             self.cfg.task_name,
@@ -95,6 +99,7 @@ class Workspace:
             self.cfg.obj_set,
             self.cfg.render_mode,
             self.cfg.shader_pack,
+            self.cfg.render_backend,
         )
         self.cfg.world_model.action_dim = self.train_env.action_spec().shape[0]
         # create replay buffer
@@ -166,17 +171,27 @@ class Workspace:
     def eval(self):
         step, episode, total_reward, total_success = 0, 0, 0, 0
         eval_until_episode = drq_utils.Until(self.cfg.num_eval_episodes, bar_name='eval_eps')
+        eval_action_norms = []
+        eval_frame_deltas = []
 
         while eval_until_episode(episode):
             time_step = self.eval_env.reset()
             episode_success = 0
-            self.video_recorder.init(self.eval_env, enabled=(episode == 0))
+            prev_pixels = time_step.observation[-3:].copy()
+            record_episode = episode < self.max_eval_videos
+            self.video_recorder.init(self.eval_env, enabled=record_episode)
             while not time_step.last():
                 with torch.no_grad(), drq_utils.eval_mode(self.agent):
                     action = self.agent.act(time_step.observation,
                                             self.global_step,
                                             eval_mode=True)
+                action_norm = float(np.linalg.norm(action))
+                eval_action_norms.append(action_norm)
                 time_step = self.eval_env.step(action)
+                curr_pixels = time_step.observation[-3:].copy()
+                frame_delta = float(np.mean(np.abs(curr_pixels - prev_pixels)))
+                eval_frame_deltas.append(frame_delta)
+                prev_pixels = curr_pixels
                 self.video_recorder.record(self.eval_env, time_step.reward)
                 total_reward += time_step.reward
                 episode_success += time_step.success
@@ -185,7 +200,7 @@ class Workspace:
             total_success += episode_success >= 1.0
             episode += 1
             # self.video_recorder.save(f'{self.global_frame}.mp4')
-            self.video_recorder.save(f'{self.global_frame}.gif')
+            self.video_recorder.save(f'{self.global_frame}_ep{episode - 1}.gif')
 
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
             log('episode_reward', total_reward / episode)
@@ -193,6 +208,19 @@ class Workspace:
             log('episode_length', step * self.cfg.action_repeat / episode)
             log('episode', self.global_episode)
             log('step', self.global_step)
+            if eval_action_norms:
+                action_norms = np.array(eval_action_norms)
+                frame_deltas = np.array(eval_frame_deltas) if eval_frame_deltas else np.array([0.0])
+                log('action_norm_mean', action_norms.mean())
+                log('action_norm_min', action_norms.min())
+                log('action_norm_max', action_norms.max())
+                log('obs_delta_mean', frame_deltas.mean())
+                log('obs_delta_min', frame_deltas.min())
+                log('obs_delta_max', frame_deltas.max())
+                log('zero_action_frac', float(np.mean(action_norms < 1e-3)))
+                log('still_frame_frac', float(np.mean(frame_deltas < 1.0)))
+                print(f"[eval] action_norm mean={action_norms.mean():.4f}, min={action_norms.min():.4f}, max={action_norms.max():.4f}")
+                print(f"[eval] frame_delta mean={frame_deltas.mean():.4f}, min={frame_deltas.min():.4f}, max={frame_deltas.max():.4f}")
 
     def generate(self):
         if self._replay_iter is None:
@@ -205,6 +233,18 @@ class Workspace:
             policy,
             self.cfg.gen_horizon
         )
+        if rewards.ndim == 0:
+            rollout_batch = 1
+            rollout_horizon = 1
+        elif rewards.ndim == 1:
+            rollout_batch = 1
+            rollout_horizon = rewards.shape[0]
+        else:
+            rollout_batch = rewards.shape[0]
+            rollout_horizon = rewards.shape[1]
+        imag_steps = int(rollout_batch * rollout_horizon)
+        self._global_imag_step += imag_steps
+        gif_count = 0
         for i in range(len(obss)):
             path = self.imag_replay_storage._store_episode(
             # path = self.imag_replay_loader.dataset._direct_store_episode(
@@ -216,7 +256,7 @@ class Workspace:
                 }
             )
             # save_gif
-            if i % 10 == 0:
+            if gif_count < self.max_gifs_per_type and i % 10 == 0:
                 gif_path = str(path).replace('imag_buffer', 'imag_gif').replace('.npz', '.gif')
                 os.makedirs(os.path.dirname(gif_path), exist_ok=True)
                 frames = []
@@ -226,9 +266,12 @@ class Workspace:
                     cv2.putText(frame, f'{rewards[i][j].item():.2f}', (10, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
                     frames.append(frame)
                 imageio.mimsave(gif_path, frames, fps=4, loop=0)
+                gif_count += 1
         print(f'generate time: {time.time() - start}')
         return {
             "gen/reward_mean": rewards.mean().item(),
+            "gen/imag_steps": imag_steps,
+            "gen/imag_total_steps": self._global_imag_step,
         }
 
     def validate(self, global_frame):
@@ -247,9 +290,12 @@ class Workspace:
         )
         obs_mse = ((obs_pred[:, 1:] - (obs_gt[:, 1:]/255.).to(obs_pred.device)) ** 2).mean()
         reward_mse = ((reward_pred[:, 1:] - reward_gt[:, 1:].to(reward_pred.device)) ** 2).mean()
+        action_norms = torch.linalg.norm(action, dim=-1).reshape(-1)
         print(f'validate time: {time.time() - start}')
+        if action_norms.numel() > 0:
+            print(f"[validate] action_norm mean={action_norms.mean().item():.4f}, min={action_norms.min().item():.4f}, max={action_norms.max().item():.4f}")
         
-        for i in range(obs_gt.shape[0]):
+        for i in range(min(obs_gt.shape[0], self.max_gifs_per_type)):
             gif_path = os.path.join(self.work_dir, 'validate_gif', f'val-sample-{global_frame}-{i}.gif')
             os.makedirs(os.path.dirname(gif_path), exist_ok=True)
             frames = []
@@ -269,6 +315,9 @@ class Workspace:
         return {
             "val/obs_mse": obs_mse.item(),
             "val/reward_mse": reward_mse.item(),
+            "val/action_norm_mean": action_norms.mean().item() if action_norms.numel() else 0.0,
+            "val/action_norm_min": action_norms.min().item() if action_norms.numel() else 0.0,
+            "val/action_norm_max": action_norms.max().item() if action_norms.numel() else 0.0,
         }
 
     def train(self):
@@ -373,7 +422,8 @@ class Workspace:
                 
                 if self.global_step * self.cfg.action_repeat >= self.cfg.start_mbpo and not init_gen:
                     for _ in trange(self.cfg.init_gen_times):
-                        self.generate()
+                        metrics = self.generate()
+                        self.logger.log_metrics(metrics, self.global_frame, ty='train')
                     init_gen = True
 
                 for _ in range(self.cfg.agent_update_times):

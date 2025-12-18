@@ -180,9 +180,13 @@ class ReplayBuffer(IterableDataset):
         except:
             traceback.print_exc()
         self._samples_since_last_fetch += 1
-        episode = self._sample_episode()
+        while True:
+            episode = self._sample_episode()
+            length = episode_len(episode)
+            if length > self._nstep:
+                break
         # add +1 for the first dummy transition
-        idx = np.random.randint(0, episode_len(episode) - self._nstep + 1) + 1
+        idx = np.random.randint(0, length - self._nstep + 1) + 1
         obs = episode['observation'][idx - 1]
         action = episode['action'][idx]
         next_obs = episode['observation'][idx + self._nstep - 1]
@@ -212,8 +216,12 @@ class ReplaySegmentBuffer(ReplayBuffer):
         except:
             traceback.print_exc()
         self._samples_since_last_fetch += 1
-        episode = self._sample_episode()
-        idx = np.random.randint(1, episode_len(episode) - self._segment_length)
+        while True:
+            episode = self._sample_episode()
+            length = episode_len(episode)
+            if length > self._segment_length:
+                break
+        idx = np.random.randint(1, length - self._segment_length)
         obs = episode['observation'][idx - 1: idx + self._segment_length - 1, -3:]
         action = episode['action'][idx: idx + self._segment_length]
         reward = episode['reward'][idx: idx + self._segment_length]
@@ -221,7 +229,13 @@ class ReplaySegmentBuffer(ReplayBuffer):
 
 
 def _worker_init_fn(worker_id):
-    seed = np.random.get_state()[1][0] + worker_id
+    state = np.random.get_state()
+    state_array = state[1]
+    if isinstance(state_array, (list, tuple, np.ndarray)):
+        base_seed = int(state_array[0])
+    else:
+        base_seed = int(state_array)
+    seed = base_seed + worker_id
     np.random.seed(seed)
     random.seed(seed)
 

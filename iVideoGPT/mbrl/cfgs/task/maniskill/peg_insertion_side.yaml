@@ -1,14 +1,14 @@
 defaults:
   - _self_
 
-task_name: PutOnPlateInScene25Main-v3
+task_name: PegInsertionSide-v1
 frame_stack: 3
 action_repeat: 2
-max_episode_steps: 80
+max_episode_steps: 200
 num_train_frames: 1000002
 num_seed_frames: 4000
 eval_every_frames: 5000
 num_eval_episodes: 10
 stddev_schedule: 'linear(1.0,0.2,100000)'
-obj_set: train
-control_mode: null
+obj_set: null
+control_mode: pd_joint_delta_pos

@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--obj_set", type=str, default="train")
     parser.add_argument("--render_mode", type=str, default="all")
     parser.add_argument("--shader_pack", type=str, default="default")
+    parser.add_argument("--render_backend", type=str, default="gpu")
     parser.add_argument("--size", type=int, nargs=2, default=(64, 64), metavar=("H", "W"),
                         help="Observation height and width used for saving demos")
     parser.add_argument("--trajectory_path", type=Path,
@@ -126,6 +127,7 @@ def main():
         args.obj_set,
         args.render_mode,
         args.shader_pack,
+        args.render_backend,
         size=tuple(args.size),
     )
 

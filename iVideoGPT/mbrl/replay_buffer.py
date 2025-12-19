@@ -221,7 +221,8 @@ class ReplaySegmentBuffer(ReplayBuffer):
             length = episode_len(episode)
             if length > self._segment_length:
                 break
-        idx = np.random.randint(1, length - self._segment_length)
+        # ensure the upper bound accounts for inclusive end index
+        idx = np.random.randint(1, length - self._segment_length + 1)
         obs = episode['observation'][idx - 1: idx + self._segment_length - 1, -3:]
         action = episode['action'][idx: idx + self._segment_length]
         reward = episode['reward'][idx: idx + self._segment_length]

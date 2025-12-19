@@ -168,24 +168,39 @@ class ManiSkill(dm_env.Environment):
         return action
 
     def _extract_image(self, obs) -> np.ndarray:
-        if self._use_rlinf:
-            frame = obs["images"][0]
-            frame = _to_numpy(frame)
-            if frame.ndim == 3:
-                frame = np.transpose(frame, (1, 2, 0))
-            else:
-                frame = np.transpose(frame, (1, 2, 0))
+        # Prefer the human-render camera (official view) whenever available.
+        if hasattr(self._env, "render"):
+            try:
+                frame = self._env.render()
+            except Exception:
+                frame = None
+            if frame is not None:
+                frame = _to_numpy(frame)
+                if frame.ndim == 4 and frame.shape[0] == 1:
+                    frame = frame[0]
         else:
-            sensor_data = obs.get("sensor_data", {})
-            camera = sensor_data.get("base_camera")
-            if camera is None and sensor_data:
-                camera = next(iter(sensor_data.values()))
-            if camera is None:
-                raise KeyError("No camera image found in ManiSkill observation.")
-            frame = camera["rgb"]
-            frame = _to_numpy(frame)
-            if frame.ndim == 4:
-                frame = frame[0]
+            frame = None
+
+        # Fall back to agent observation cameras if render is unavailable.
+        if frame is None:
+            if self._use_rlinf:
+                frame = obs["images"][0]
+                frame = _to_numpy(frame)
+                if frame.ndim == 3:
+                    frame = np.transpose(frame, (1, 2, 0))
+                else:
+                    frame = np.transpose(frame, (1, 2, 0))
+            else:
+                sensor_data = obs.get("sensor_data", {})
+                camera = sensor_data.get("base_camera")
+                if camera is None and sensor_data:
+                    camera = next(iter(sensor_data.values()))
+                if camera is None:
+                    raise KeyError("No camera image found in ManiSkill observation.")
+                frame = camera["rgb"]
+                frame = _to_numpy(frame)
+                if frame.ndim == 4:
+                    frame = frame[0]
         frame = frame.astype(np.uint8)
         frame = cv2.resize(frame, (self._size[1], self._size[0]))
         return frame
@@ -281,6 +296,13 @@ class ManiSkill(dm_env.Environment):
         if hasattr(self._env, "capture_image"):
             image = self._env.capture_image()
             if isinstance(image, np.ndarray):
+                return image
+        if hasattr(self._env, "render"):
+            image = self._env.render()
+            if image is not None:
+                image = _to_numpy(image)
+                if image.ndim == 4 and image.shape[0] == 1:
+                    image = image[0]
                 return image
         if self._last_obs is not None:
             return self._last_obs

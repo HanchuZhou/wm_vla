@@ -63,7 +63,8 @@ class Workspace:
         self.timer = drq_utils.Timer()
         self._global_step = 0
         self._global_episode = 0
-        self._global_imag_step = 0
+        self._global_imag_step = 0  # counts how often generate() runs
+        self._global_imag_transitions = 0  # cumulative imagined transitions
 
     def setup(self):
         # create logger
@@ -243,7 +244,9 @@ class Workspace:
             rollout_batch = rewards.shape[0]
             rollout_horizon = rewards.shape[1]
         imag_steps = int(rollout_batch * rollout_horizon)
-        self._global_imag_step += imag_steps
+        # track env interactions separately from imagined transitions
+        self._global_imag_step += 1
+        self._global_imag_transitions += imag_steps
         gif_count = 0
         for i in range(len(obss)):
             path = self.imag_replay_storage._store_episode(
@@ -272,6 +275,7 @@ class Workspace:
             "gen/reward_mean": rewards.mean().item(),
             "gen/imag_steps": imag_steps,
             "gen/imag_total_steps": self._global_imag_step,
+            "gen/imag_total_transitions": self._global_imag_transitions,
         }
 
     def validate(self, global_frame):

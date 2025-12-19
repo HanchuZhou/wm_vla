@@ -1,0 +1,14 @@
+defaults:
+  - _self_
+
+task_name: PushT-v1
+frame_stack: 3
+action_repeat: 2
+max_episode_steps: 100
+num_train_frames: 1000002
+num_seed_frames: 4000
+eval_every_frames: 5000
+num_eval_episodes: 10
+stddev_schedule: 'linear(1.0,0.2,100000)'
+obj_set: null
+control_mode: pd_ee_delta_pose

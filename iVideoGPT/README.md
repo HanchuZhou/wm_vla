@@ -78,15 +78,19 @@ Run the MBPO + iVideoGPT pipeline on ManiSkill tasks from the repository root:
 
 1. **Collect demos** (seeds the replay buffer when `demo=true`):
    ```bash
-   python iVideoGPT/mbrl/scripts/collect_maniskill_demo.py \
-       --task PutOnPlateInScene25Main-v3 --episodes 5
-   ```
-   or
-   ```bash
-   python iVideoGPT/mbrl/scripts/collect_maniskill_demo.py     --task PickCube-v1     --trajectory_path iVideoGPT/mbrl/demonstrations/PickCube-v1/rl/trajectory.none.pd_ee_delta_pose.physx_cuda.h5     --episodes 5 --success_only --obj_set null --max_episode_steps 200
+   python -m mani_skill.utils.download_demo PickCube-v1 -o iVideoGPT/mbrl/demonstrations
    ```
 
-   Replace `PutOnPlateInScene25Main-v3` with `PickCube-v1`, `LiftPegUpright-v1`, or `PegInsertionSide-v1` to prepare demos for the other supported tasks (five official ManiSkill trajectories each).
+   The download ManiSkill trajectories should be converted to `.npz` demonstrations:
+   ```bash
+   # PickCube-v1
+   python iVideoGPT/mbrl/scripts/collect_maniskill_demo.py \
+       --task PickCube-v1 \
+       --trajectory_path iVideoGPT/mbrl/demonstrations/PickCube-v1/rl/trajectory.none.pd_ee_delta_pose.physx_cuda.h5 \
+       --episodes 5 --success_only --obj_set null --max_episode_steps 200
+   ```
+
+   Replace `task` with `PickCube-v1`, `LiftPegUpright-v1`, `PegInsertionSide-v1`, `PushT-v1`, or `StackCube-v1` to prepare demos for the other supported tasks.
 2. **Set runtime environment** (adjust paths as needed):
    ```bash
    source .venv/bin/activate
@@ -96,9 +100,9 @@ Run the MBPO + iVideoGPT pipeline on ManiSkill tasks from the repository root:
 3. **Launch training** (pin to a specific GPU if desired):
    ```bash
    CUDA_VISIBLE_DEVICES=0 python iVideoGPT/mbrl/train_maniskill_mbpo.py \
-       task=maniskill/pick_cube num_train_frames=100002 demo=true
+       task=maniskill/pick_cube num_train_frames=1000002 demo=true
    ```
-   Swap task with `task=maniskill/pick_cube`, `task=maniskill/lift_peg_upright`, or `task=maniskill/peg_insertion_side` to launch the additional benchmarks.
+   Swap task with `pick_cube`, `lift_peg_upright`, `peg_insertion_side`, `push_t`, or `stack_cube` to launch the additional benchmarks.
 
    Add `render_backend=sapien_cpu` when encounter error on `CUDA error at /__w/SAPIEN/SAPIEN/3rd_party/sapien-vulkan-2/src/core/buffer.cpp`.
 

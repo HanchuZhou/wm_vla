@@ -30,11 +30,11 @@ device: cuda
 save_video: true
 save_train_video: false
 use_tb: true
-max_gifs_per_type: 3
 max_eval_videos: 3
+max_gifs_per_type: 3
 # experiment
 experiment: exp
-exp_name: maniskill_mbpo
+exp_name: maniskill_drq
 # agent
 lr: 1e-4
 feature_dim: 50
@@ -70,50 +70,6 @@ agent:
   stddev_clip: 0.3
   beta: 0.0 # intrinsic bonus
   delay_steps: 1
-
-# mbpo
-gen_every_steps: 200
-gen_batch: 32
-gen_horizon: 10
-update_gen_every_step: 10
-update_tokenizer_every_step: 40
-update_gen_times: 1
-init_update_gen_steps: 1000
-init_gen_times: 20
-real_ratio: 0.5
-start_mbpo: 4000
-
-world_model:
-  load_pretrained_model: true
-  config_name: /home/darling/iVideoGPT/configs/llama/config.json
-  vqgan_type: ctx_vqgan
-  pretrained_model_name_or_path: /home/darling/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/tokenizer
-  pretrained_transformer_path: /home/darling/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/transformer
-  load_internal_llm: true
-  llama_attn_drop: 0.1
-  fast_reward_predictor: false
-  symlog: true
-
-  context_length: 2
-  segment_length: 12
-  action_dim: 7
-
-  batch_size: 16
-  selected_params: true
-  tok_lr: 1e-4
-  tok_wd: 0.0
-  tok_beta1: 0.9
-  tok_beta2: 0.999
-  max_grad_norm: 1.0
-  max_target_frames: 5
-
-  model_lr: 1e-4
-  model_wd: 0.0
-  embed_no_wd: true
-
-  reward_lr: 1e-4
-  reward_wd: 1e-6
-  reward_weight: 1.0
 
 hydra:
   run:

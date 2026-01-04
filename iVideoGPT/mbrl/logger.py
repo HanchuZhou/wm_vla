@@ -12,6 +12,11 @@ import torchvision
 from termcolor import colored
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None
+
 # TODO: add more formats
 COMMON_TRAIN_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
                        ('episode', 'E', 'int'), ('episode_length', 'L', 'int'),
@@ -124,7 +129,7 @@ class MetersGroup(object):
 
 
 class Logger(object):
-    def __init__(self, log_dir, use_tb):
+    def __init__(self, log_dir, use_tb, wandb_run=None):
         self._log_dir = log_dir
         self._train_mg = MetersGroup(log_dir / 'train.csv',
                                      formating=COMMON_TRAIN_FORMAT)
@@ -134,10 +139,41 @@ class Logger(object):
             self._sw = SummaryWriter(str(log_dir / 'tb'))
         else:
             self._sw = None
+        self._wandb = wandb_run
+        self._wandb_buffer = {}
+        self._wandb_step = None
+
+    def _buffer_wandb(self, key, value, step):
+        if self._wandb is None:
+            return
+        # Log immediately to wandb (non-committed) to avoid overwriting
+        # buffered metrics when many metrics use the same buffered dict.
+        # We'll still keep the flush mechanism for explicit commits.
+        try:
+            self._wandb.log({key: value}, step=step, commit=False)
+        except Exception:
+            # Fallback to buffering if immediate logging fails for any reason
+            if self._wandb_step is None:
+                self._wandb_step = step
+            elif step != self._wandb_step:
+                self._flush_wandb()
+                self._wandb_step = step
+            self._wandb_buffer[key] = value
+
+    def _flush_wandb(self):
+        if self._wandb is None or not self._wandb_buffer:
+            return
+        try:
+            self._wandb.log(self._wandb_buffer, step=self._wandb_step, commit=True)
+        except Exception:
+            pass
+        self._wandb_buffer = {}
+        self._wandb_step = None
 
     def _try_sw_log(self, key, value, step):
         if self._sw is not None:
             self._sw.add_scalar(key, value, step)
+        self._buffer_wandb(key, value, step)
 
     def log(self, key, value, step):
         assert key.startswith('train') or key.startswith('eval')
@@ -156,6 +192,7 @@ class Logger(object):
             self._eval_mg.dump(step, 'eval')
         if ty is None or ty == 'train':
             self._train_mg.dump(step, 'train')
+        self._flush_wandb()
 
     def log_and_dump_ctx(self, step, ty):
         return LogAndDumpCtx(self, step, ty)

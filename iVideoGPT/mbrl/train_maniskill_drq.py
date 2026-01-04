@@ -19,6 +19,7 @@ from dm_env import specs
 import maniskill_env
 import drq_utils
 from logger import Logger
+from omegaconf import OmegaConf
 from replay_buffer import ReplayBufferStorage, make_replay_loader
 from video import TrainVideoRecorder, VideoRecorder
 
@@ -39,6 +40,7 @@ class Workspace:
         self.cfg = cfg
         self.max_gifs_per_type = getattr(cfg, "max_gifs_per_type", 3)
         self.max_eval_videos = getattr(cfg, "max_eval_videos", 3)
+        self.wandb_run = self._init_wandb()
         drq_utils.set_seed_everywhere(cfg.seed)
         self.device = torch.device(cfg.device)
         self.setup()
@@ -52,9 +54,60 @@ class Workspace:
         self._global_step = 0
         self._global_episode = 0
 
+    def _init_wandb(self):
+        wb_cfg = getattr(self.cfg, "wandb", None)
+        if wb_cfg is None or not getattr(wb_cfg, "enable", False):
+            return None
+        try:
+            import wandb
+        except ImportError:
+            print("wandb not installed; skipping wandb logging.")
+            return None
+        entity = getattr(wb_cfg, "entity", None) or getattr(wb_cfg, "team", None)
+        project = getattr(wb_cfg, "project", self.cfg.task_name)
+        group = getattr(wb_cfg, "group", self.cfg.exp_name)
+        mode = getattr(wb_cfg, "mode", "online")
+        tags = []
+        team = getattr(wb_cfg, "team", None)
+        org = getattr(wb_cfg, "org", None)
+        if team:
+            tags.append(f"team:{team}")
+        if org:
+            tags.append(f"org:{org}")
+        base_run_name = self.cfg.exp_name
+        hydra_name = getattr(self.cfg, "name", None)
+        if hydra_name and str(hydra_name) != "0":
+            base_run_name = f"{base_run_name}_{hydra_name}"
+        # allow both wandb.run_name and wandb.name as a suffix
+        custom_suffix = getattr(wb_cfg, "run_name", None) or getattr(wb_cfg, "name", None)
+        run_name = f"{base_run_name}_{custom_suffix}" if custom_suffix else base_run_name
+        config_dict = OmegaConf.to_container(self.cfg, resolve=True)
+        run = wandb.init(
+            entity=entity,
+            project=project,
+            group=group,
+            name=run_name,
+            mode=mode,
+            tags=tags,
+            config=config_dict,
+            dir=str(self.work_dir),
+        )
+        try:
+            run.define_metric("eval/step")
+            run.define_metric("eval/*", step_metric="eval/step")
+        except Exception:
+            pass
+        return run
+
+    def should_save_gif(self, frame):
+        interval = getattr(self.cfg, "gif_save_every_frames", None)
+        if interval is None or interval <= 0:
+            return True
+        return (frame % interval) == 0
+
     def setup(self):
         # create logger
-        self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb)
+        self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb, wandb_run=self.wandb_run)
         # create envs
         self.train_env = maniskill_env.make(
             self.cfg.task_name,
@@ -151,7 +204,7 @@ class Workspace:
         while eval_until_episode(episode):
             time_step = self.eval_env.reset()
             episode_success = 0
-            record_episode = episode < self.max_eval_videos
+            record_episode = (episode < self.max_eval_videos) and self.should_save_gif(self.global_frame)
             self.video_recorder.init(self.eval_env, enabled=record_episode)
             while not time_step.last():
                 with torch.no_grad(), drq_utils.eval_mode(self.agent):
@@ -166,14 +219,26 @@ class Workspace:
 
             total_success += episode_success >= 1.0
             episode += 1
-            self.video_recorder.save(f"{self.global_frame}_ep{episode - 1}.gif")
+            if self.video_recorder.enabled:
+                self.video_recorder.save(f"{self.global_frame}_ep{episode - 1}.gif")
 
+        eval_logs = {
+            "episode_reward": total_reward / episode,
+            "episode_success": total_success / episode,
+            "episode_length": step * self.cfg.action_repeat / episode,
+            "episode": self.global_episode,
+            "step": self.global_step,
+        }
         with self.logger.log_and_dump_ctx(self.global_frame, ty="eval") as log:
-            log("episode_reward", total_reward / episode)
-            log("episode_success", total_success / episode)
-            log("episode_length", step * self.cfg.action_repeat / episode)
-            log("episode", self.global_episode)
-            log("step", self.global_step)
+            for k, v in eval_logs.items():
+                log(k, v)
+        if self.wandb_run is not None:
+            try:
+                eval_payload = {f"eval/{k}": v for k, v in eval_logs.items()}
+                eval_payload["eval/step"] = self.global_step
+                self.wandb_run.log(eval_payload, step=self.global_frame, commit=True)
+            except Exception:
+                pass
 
     def train(self):
         assert (
@@ -200,20 +265,19 @@ class Workspace:
             if time_step.last():
                 self._global_episode += 1
                 self.train_video_recorder.save(f"{self.global_frame}.gif")
-                if metrics is not None:
-                    elapsed_time, total_time = self.timer.reset()
-                    episode_frame = episode_step * self.cfg.action_repeat
-                    with self.logger.log_and_dump_ctx(
-                        self.global_frame, ty="train"
-                    ) as log:
-                        log("fps", episode_frame / elapsed_time)
-                        log("total_time", total_time)
-                        log("episode_reward", episode_reward)
-                        log("episode_success", episode_success >= 1.0)
-                        log("episode_length", episode_frame)
-                        log("episode", self.global_episode)
-                        log("buffer_size", len(self.replay_storage))
-                        log("step", self.global_step)
+                elapsed_time, total_time = self.timer.reset()
+                episode_frame = episode_step * self.cfg.action_repeat
+                with self.logger.log_and_dump_ctx(
+                    self.global_frame, ty="train"
+                ) as log:
+                    log("fps", episode_frame / elapsed_time if elapsed_time > 0 else 0.0)
+                    log("total_time", total_time)
+                    log("episode_reward", episode_reward)
+                    log("episode_success", episode_success >= 1.0)
+                    log("episode_length", episode_frame)
+                    log("episode", self.global_episode)
+                    log("buffer_size", len(self.replay_storage))
+                    log("step", self.global_step)
 
                 time_step = self.train_env.reset()
                 self.replay_storage.add(time_step)

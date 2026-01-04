@@ -24,6 +24,7 @@ import subprocess
 import maniskill_env
 import drq_utils
 from logger import Logger
+from omegaconf import OmegaConf
 from replay_buffer import ReplayBufferStorage, make_replay_loader, make_segment_replay_loader
 from video import TrainVideoRecorder, VideoRecorder
 from video_predictor import VideoPredictor
@@ -39,7 +40,7 @@ def make_agent(obs_spec, action_spec, cfg):
 
 
 def make_video_predictor(cfg):
-    return VideoPredictor('cuda', cfg)
+        return VideoPredictor('cuda', cfg)
 
 
 class Workspace:
@@ -50,6 +51,7 @@ class Workspace:
         self.cfg = cfg
         self.max_gifs_per_type = getattr(cfg, 'max_gifs_per_type', 3)
         self.max_eval_videos = getattr(cfg, 'max_eval_videos', 3)
+        self.wandb_run = self._init_wandb()
         drq_utils.set_seed_everywhere(cfg.seed)
         self.device = torch.device(cfg.device)
         self.setup()
@@ -66,9 +68,76 @@ class Workspace:
         self._global_imag_step = 0  # counts how often generate() runs
         self._global_imag_transitions = 0  # cumulative imagined transitions
 
+    def _init_wandb(self):
+        wb_cfg = getattr(self.cfg, 'wandb', None)
+        if wb_cfg is None or not getattr(wb_cfg, 'enable', False):
+            return None
+        try:
+            import wandb
+        except ImportError:
+            print('wandb not installed; skipping wandb logging.')
+            return None
+        # wandb uses the team name as the entity; prefer team if provided.
+        entity = getattr(wb_cfg, 'entity', None) or getattr(wb_cfg, 'team', None)
+        project = getattr(wb_cfg, 'project', self.cfg.task_name)
+        group = getattr(wb_cfg, 'group', self.cfg.exp_name)
+        mode = getattr(wb_cfg, 'mode', 'online')
+        tags = []
+        team = getattr(wb_cfg, 'team', None)
+        org = getattr(wb_cfg, 'org', None)
+        if team:
+            tags.append(f'team:{team}')
+        if org:
+            tags.append(f'org:{org}')
+        base_run_name = self.cfg.exp_name
+        hydra_name = getattr(self.cfg, "name", None)
+        if hydra_name and str(hydra_name) != "0":
+            base_run_name = f"{base_run_name}_{hydra_name}"
+        # allow both wandb.run_name and wandb.name as a suffix
+        custom_suffix = getattr(wb_cfg, 'run_name', None) or getattr(wb_cfg, 'name', None)
+        run_name = f'{base_run_name}_{custom_suffix}' if custom_suffix else base_run_name
+        config_dict = OmegaConf.to_container(self.cfg, resolve=True)
+        run = wandb.init(
+            entity=entity,
+            project=project,
+            group=group,
+            name=run_name,
+            mode=mode,
+            tags=tags,
+            config=config_dict,
+            dir=str(self.work_dir),
+        )
+        try:
+            # Make sure eval metrics use their own step key and stay visible.
+            run.define_metric("eval/step")
+            run.define_metric("eval/*", step_metric="eval/step")
+        except Exception:
+            pass
+        return run
+
+    def _log_wandb_gif(self, key: str, path: str | os.PathLike):
+        """Log a saved GIF file to wandb if enabled."""
+        if self.wandb_run is None:
+            return
+        path = str(path)
+        if not os.path.exists(path):
+            return
+        try:
+            import wandb
+            media = wandb.Video(path, fps=4, format="gif")
+            self.wandb_run.log({key: media}, step=self.global_frame, commit=False)
+        except Exception:
+            pass
+
+    def should_save_gif(self, frame):
+        interval = getattr(self.cfg, 'gif_save_every_frames', None)
+        if interval is None or interval <= 0:
+            return True
+        return (frame % interval) == 0
+
     def setup(self):
         # create logger
-        self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb)
+        self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb, wandb_run=self.wandb_run)
         # create envs
         self.train_env = maniskill_env.make(
             self.cfg.task_name,
@@ -179,7 +248,7 @@ class Workspace:
             time_step = self.eval_env.reset()
             episode_success = 0
             prev_pixels = time_step.observation[-3:].copy()
-            record_episode = episode < self.max_eval_videos
+            record_episode = (episode < self.max_eval_videos) and self.should_save_gif(self.global_frame)
             self.video_recorder.init(self.eval_env, enabled=record_episode)
             while not time_step.last():
                 with torch.no_grad(), drq_utils.eval_mode(self.agent):
@@ -201,27 +270,46 @@ class Workspace:
             total_success += episode_success >= 1.0
             episode += 1
             # self.video_recorder.save(f'{self.global_frame}.mp4')
-            self.video_recorder.save(f'{self.global_frame}_ep{episode - 1}.gif')
+            if self.video_recorder.enabled:
+                file_name = f'{self.global_frame}_ep{episode - 1}.gif'
+                self.video_recorder.save(file_name)
+                self._log_wandb_gif('eval/gif', self.work_dir / 'eval_video' / file_name)
+
+        eval_logs = {
+            "episode_reward": total_reward / episode,
+            "episode_success": total_success / episode,
+            "episode_length": step * self.cfg.action_repeat / episode,
+            "episode": self.global_episode,
+            "step": self.global_step,
+        }
+        if eval_action_norms:
+            action_norms = np.array(eval_action_norms)
+            frame_deltas = np.array(eval_frame_deltas) if eval_frame_deltas else np.array([0.0])
+            eval_logs.update(
+                {
+                    "action_norm_mean": action_norms.mean(),
+                    "action_norm_min": action_norms.min(),
+                    "action_norm_max": action_norms.max(),
+                    "obs_delta_mean": frame_deltas.mean(),
+                    "obs_delta_min": frame_deltas.min(),
+                    "obs_delta_max": frame_deltas.max(),
+                    "zero_action_frac": float(np.mean(action_norms < 1e-3)),
+                    "still_frame_frac": float(np.mean(frame_deltas < 1.0)),
+                }
+            )
+            print(f"[eval] action_norm mean={action_norms.mean():.4f}, min={action_norms.min():.4f}, max={action_norms.max():.4f}")
+            print(f"[eval] frame_delta mean={frame_deltas.mean():.4f}, min={frame_deltas.min():.4f}, max={frame_deltas.max():.4f}")
 
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
-            log('episode_reward', total_reward / episode)
-            log('episode_success', total_success / episode)
-            log('episode_length', step * self.cfg.action_repeat / episode)
-            log('episode', self.global_episode)
-            log('step', self.global_step)
-            if eval_action_norms:
-                action_norms = np.array(eval_action_norms)
-                frame_deltas = np.array(eval_frame_deltas) if eval_frame_deltas else np.array([0.0])
-                log('action_norm_mean', action_norms.mean())
-                log('action_norm_min', action_norms.min())
-                log('action_norm_max', action_norms.max())
-                log('obs_delta_mean', frame_deltas.mean())
-                log('obs_delta_min', frame_deltas.min())
-                log('obs_delta_max', frame_deltas.max())
-                log('zero_action_frac', float(np.mean(action_norms < 1e-3)))
-                log('still_frame_frac', float(np.mean(frame_deltas < 1.0)))
-                print(f"[eval] action_norm mean={action_norms.mean():.4f}, min={action_norms.min():.4f}, max={action_norms.max():.4f}")
-                print(f"[eval] frame_delta mean={frame_deltas.mean():.4f}, min={frame_deltas.min():.4f}, max={frame_deltas.max():.4f}")
+            for k, v in eval_logs.items():
+                log(k, v)
+        if self.wandb_run is not None:
+            try:
+                eval_payload = {f"eval/{k}": v for k, v in eval_logs.items()}
+                eval_payload["eval/step"] = self.global_step
+                self.wandb_run.log(eval_payload, step=self.global_frame, commit=True)
+            except Exception:
+                pass
 
     def generate(self):
         if self._replay_iter is None:
@@ -259,7 +347,7 @@ class Workspace:
                 }
             )
             # save_gif
-            if gif_count < self.max_gifs_per_type and i % 10 == 0:
+            if self.should_save_gif(self.global_frame) and gif_count < self.max_gifs_per_type and i % 10 == 0:
                 gif_path = str(path).replace('imag_buffer', 'imag_gif').replace('.npz', '.gif')
                 os.makedirs(os.path.dirname(gif_path), exist_ok=True)
                 frames = []
@@ -270,6 +358,7 @@ class Workspace:
                     frames.append(frame)
                 imageio.mimsave(gif_path, frames, fps=4, loop=0)
                 gif_count += 1
+                self._log_wandb_gif('imag/gif', gif_path)
         print(f'generate time: {time.time() - start}')
         return {
             "gen/reward_mean": rewards.mean().item(),
@@ -299,22 +388,24 @@ class Workspace:
         if action_norms.numel() > 0:
             print(f"[validate] action_norm mean={action_norms.mean().item():.4f}, min={action_norms.min().item():.4f}, max={action_norms.max().item():.4f}")
         
-        for i in range(min(obs_gt.shape[0], self.max_gifs_per_type)):
-            gif_path = os.path.join(self.work_dir, 'validate_gif', f'val-sample-{global_frame}-{i}.gif')
-            os.makedirs(os.path.dirname(gif_path), exist_ok=True)
-            frames = []
-            for t in range(obs_gt.shape[1]):
-                frame = (obs_gt[i, t, -3:].permute(1,2,0).detach().cpu().numpy()).astype(np.uint8)
-                frame = np.ascontiguousarray(frame)
-                frame_pred = (obs_pred[i, t, -3:].permute(1,2,0).detach().cpu().numpy() * 255).astype(np.uint8)
-                frame_pred = np.ascontiguousarray(frame_pred)
-                frame_error = np.abs(frame.astype(float) - frame_pred.astype(float)).astype(np.uint8)
-                if t > 0:
-                    cv2.putText(frame, f'{reward_gt[i, t].item():.2f}', (10, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
-                    cv2.putText(frame_pred, f'{reward_pred[i, t].item():.2f}', (10, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
-                
-                frames.append(np.concatenate([frame, frame_pred, frame_error], axis=1))
-            imageio.mimsave(gif_path, frames, fps=4, loop=0)
+        if self.should_save_gif(global_frame):
+            for i in range(min(obs_gt.shape[0], self.max_gifs_per_type)):
+                gif_path = os.path.join(self.work_dir, 'validate_gif', f'val-sample-{global_frame}-{i}.gif')
+                os.makedirs(os.path.dirname(gif_path), exist_ok=True)
+                frames = []
+                for t in range(obs_gt.shape[1]):
+                    frame = (obs_gt[i, t, -3:].permute(1,2,0).detach().cpu().numpy()).astype(np.uint8)
+                    frame = np.ascontiguousarray(frame)
+                    frame_pred = (obs_pred[i, t, -3:].permute(1,2,0).detach().cpu().numpy() * 255).astype(np.uint8)
+                    frame_pred = np.ascontiguousarray(frame_pred)
+                    frame_error = np.abs(frame.astype(float) - frame_pred.astype(float)).astype(np.uint8)
+                    if t > 0:
+                        cv2.putText(frame, f'{reward_gt[i, t].item():.2f}', (10, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                        cv2.putText(frame_pred, f'{reward_pred[i, t].item():.2f}', (10, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                    
+                    frames.append(np.concatenate([frame, frame_pred, frame_error], axis=1))
+                imageio.mimsave(gif_path, frames, fps=4, loop=0)
+                self._log_wandb_gif('validate/gif', gif_path)
             
         return {
             "val/obs_mse": obs_mse.item(),
@@ -352,21 +443,19 @@ class Workspace:
                 self._global_episode += 1
                 # self.train_video_recorder.save(f'{self.global_frame}.mp4')
                 self.train_video_recorder.save(f'{self.global_frame}.gif')
-                # wait until all the metrics schema is populated
-                if metrics is not None:
-                    # log stats
-                    elapsed_time, total_time = self.timer.reset()
-                    episode_frame = episode_step * self.cfg.action_repeat
-                    with self.logger.log_and_dump_ctx(self.global_frame,
-                                                      ty='train') as log:
-                        log('fps', episode_frame / elapsed_time)
-                        log('total_time', total_time)
-                        log('episode_reward', episode_reward)
-                        log('episode_success', episode_success >= 1.0)
-                        log('episode_length', episode_frame)
-                        log('episode', self.global_episode)
-                        log('buffer_size', len(self.replay_storage))
-                        log('step', self.global_step)
+                # log stats every episode (even before model updates) so wandb has continuous steps
+                elapsed_time, total_time = self.timer.reset()
+                episode_frame = episode_step * self.cfg.action_repeat
+                with self.logger.log_and_dump_ctx(self.global_frame,
+                                                  ty='train') as log:
+                    log('fps', episode_frame / elapsed_time if elapsed_time > 0 else 0.0)
+                    log('total_time', total_time)
+                    log('episode_reward', episode_reward)
+                    log('episode_success', episode_success >= 1.0)
+                    log('episode_length', episode_frame)
+                    log('episode', self.global_episode)
+                    log('buffer_size', len(self.replay_storage))
+                    log('step', self.global_step)
 
                 # reset env
                 time_step = self.train_env.reset()

@@ -168,7 +168,8 @@ class ManiSkill(dm_env.Environment):
         return action
 
     def _extract_image(self, obs) -> np.ndarray:
-        # Prefer the human-render camera (official view) whenever available.
+        # Prefer the official render view to keep a consistent camera across eval/imag/validate GIFs.
+        frame = None
         if hasattr(self._env, "render"):
             try:
                 frame = self._env.render()
@@ -178,21 +179,21 @@ class ManiSkill(dm_env.Environment):
                 frame = _to_numpy(frame)
                 if frame.ndim == 4 and frame.shape[0] == 1:
                     frame = frame[0]
-        else:
-            frame = None
 
-        # Fall back to agent observation cameras if render is unavailable.
+        # Fall back to observation cameras if render is unavailable.
         if frame is None:
             if self._use_rlinf:
                 frame = obs["images"][0]
                 frame = _to_numpy(frame)
-                if frame.ndim == 3:
-                    frame = np.transpose(frame, (1, 2, 0))
-                else:
-                    frame = np.transpose(frame, (1, 2, 0))
+                frame = np.transpose(frame, (1, 2, 0))
             else:
                 sensor_data = obs.get("sensor_data", {})
-                camera = sensor_data.get("base_camera")
+                camera = None
+                # Prefer official third-view camera if available; otherwise base camera.
+                if "3rd_view_camera" in sensor_data:
+                    camera = sensor_data.get("3rd_view_camera")
+                if camera is None:
+                    camera = sensor_data.get("base_camera")
                 if camera is None and sensor_data:
                     camera = next(iter(sensor_data.values()))
                 if camera is None:
@@ -280,6 +281,7 @@ class ManiSkill(dm_env.Environment):
         if done:
             self._done = True
             step_type = dm_env.StepType.LAST
+            discount = 0.0
         else:
             step_type = dm_env.StepType.MID
 

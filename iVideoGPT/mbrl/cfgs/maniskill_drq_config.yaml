@@ -3,6 +3,7 @@ defaults:
   - task: maniskill/put_on_plate_main
   - override hydra/launcher: submitit_local
 
+name: "0"  # hydra run name (can be overridden with name=foo)
 # task settings
 task_name: ${task.task_name}
 frame_stack: ${task.frame_stack}
@@ -30,6 +31,7 @@ device: cuda
 save_video: true
 save_train_video: false
 use_tb: true
+gif_save_every_frames: 30000
 max_eval_videos: 3
 max_gifs_per_type: 3
 # experiment
@@ -70,6 +72,15 @@ agent:
   stddev_clip: 0.3
   beta: 0.0 # intrinsic bonus
   delay_steps: 1
+
+wandb:
+  enable: true
+  entity: flare-robot
+  team: flare-robot
+  org: ucd-dare
+  project: ${task_name}
+  group: ${exp_name}
+  mode: online
 
 hydra:
   run:

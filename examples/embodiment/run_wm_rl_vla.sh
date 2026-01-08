@@ -18,6 +18,8 @@ RAY_OBJ_STORE_BYTES="${RAY_OBJ_STORE_BYTES:-2147483648}"
 START_RAY="${START_RAY:-1}"
 
 export MS_SKIP_ASSET_DOWNLOAD_PROMPT=1
+unset LD_PRELOAD
+export PYTHONPATH="/opt/libero${PYTHONPATH:+:${PYTHONPATH}}"
 
 if command -v link_assets >/dev/null 2>&1; then
   link_assets || true

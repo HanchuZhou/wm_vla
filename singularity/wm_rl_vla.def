@@ -100,18 +100,19 @@ EOF
   PYTHON_VERSION=3.11
 
   uv venv openpi --python=${PYTHON_VERSION}
-  source /opt/venv/openpi/bin/activate
+  . /opt/venv/openpi/bin/activate
   UV_TORCH_BACKEND=auto uv sync --active
   uv sync --extra embodied --active
   GIT_LFS_SKIP_SMUDGE=1 uv pip install git+https://github.com/RLinf/openpi
   uv pip install metaworld==3.0.0
-  uv pip uninstall -y pynvml
+  # Use pip directly to avoid uv uninstall prompt handling
+  pip uninstall -y pynvml
   cp -r /opt/venv/openpi/lib/python${PYTHON_VERSION}/site-packages/openpi/models_pytorch/transformers_replace/* \
       /opt/venv/openpi/lib/python${PYTHON_VERSION}/site-packages/transformers/
   deactivate
 
   uv venv ivideogpt --python=${PYTHON_VERSION}
-  source /opt/venv/ivideogpt/bin/activate
+  . /opt/venv/ivideogpt/bin/activate
   UV_TORCH_BACKEND=auto uv pip install -r /opt/venv/ivideogpt-requirements.txt
   uv pip install robosuite==1.4.1
   deactivate

@@ -14,8 +14,8 @@ From: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
   export MS_SKIP_ASSET_DOWNLOAD_PROMPT=1
 
 %files
-  pyproject.toml /tmp/pyproject.toml
-  iVideoGPT/requirements.txt /tmp/ivideogpt-requirements.txt
+  pyproject.toml /opt/venv/pyproject.toml
+  iVideoGPT/requirements.txt /opt/venv/ivideogpt-requirements.txt
 
 %post
   set -e
@@ -44,7 +44,6 @@ From: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
   python3 -m pip install --upgrade pip setuptools wheel uv
 
   mkdir -p /opt/venv /opt/.cache/huggingface
-  cp /tmp/pyproject.toml /opt/venv/pyproject.toml
   cd /opt/venv
 
   cat <<'EOF' > /usr/local/bin/switch_env
@@ -112,7 +111,7 @@ EOF
 
   uv venv ivideogpt --python=${PYTHON_VERSION}
   source /opt/venv/ivideogpt/bin/activate
-  UV_TORCH_BACKEND=auto uv pip install -r /tmp/ivideogpt-requirements.txt
+  UV_TORCH_BACKEND=auto uv pip install -r /opt/venv/ivideogpt-requirements.txt
   deactivate
 
   git clone -b master --depth 1 https://github.com/RLinf/LIBERO.git /opt/libero

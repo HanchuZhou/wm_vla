@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export REPO_PATH
+export PRETRAINED_ROOT="${REPO_PATH}/pretrained_models"
 
 MBPO_TASK_NAME="${MBPO_TASK_NAME:-libero_10}"
 MBPO_FRAMES="${MBPO_FRAMES:-1000002}"
@@ -25,6 +27,14 @@ if command -v link_assets >/dev/null 2>&1; then
   link_assets || true
 fi
 
+LIBERO_PKG_ROOT="/opt/venv/openpi/lib/python3.11/site-packages/libero/libero"
+LIBERO_SRC_ROOT="/opt/libero/libero/libero"
+for sub in assets bddl_files init_files; do
+  if [[ ! -d "${LIBERO_PKG_ROOT}/${sub}" && -d "${LIBERO_SRC_ROOT}/${sub}" ]]; then
+    ln -sfn "${LIBERO_SRC_ROOT}/${sub}" "${LIBERO_PKG_ROOT}/${sub}" 2>/dev/null || echo "Warning: unable to link ${sub}; run with --writable-tmpfs or bind the path into the container." >&2
+  fi
+done
+
 if [[ "${SKIP_MBRL:-0}" != "1" ]]; then
   if command -v switch_env >/dev/null 2>&1; then
     source switch_env ivideogpt
@@ -32,7 +42,12 @@ if [[ "${SKIP_MBRL:-0}" != "1" ]]; then
     source "${REPO_PATH}/.venv/bin/activate"
   fi
 
-  export PYTHONPATH="${REPO_PATH}:${REPO_PATH}/iVideoGPT:${REPO_PATH}/iVideoGPT/mbrl${PYTHONPATH:+:${PYTHONPATH}}"
+  export NUMBA_CACHE_DIR="${SCRATCH:-/tmp}/numba_cache"
+  mkdir -p "${NUMBA_CACHE_DIR}"
+
+  HOST_SITE="${REPO_PATH}/.singularity_pkgs/ivideogpt"
+  OPENPI_SITE="/opt/venv/openpi/lib/python3.11/site-packages"
+  export PYTHONPATH="${HOST_SITE}:${OPENPI_SITE}:${REPO_PATH}:${REPO_PATH}/iVideoGPT:${REPO_PATH}/iVideoGPT/mbrl${PYTHONPATH:+:${PYTHONPATH}}"
 
   CUDA_VISIBLE_DEVICES="${MBPO_GPU}" \
     python "${REPO_PATH}/iVideoGPT/mbrl/train_libero_mbpo_openpi.py" \

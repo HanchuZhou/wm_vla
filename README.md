@@ -28,6 +28,20 @@ RLinf is a flexible and scalable open-source infrastructure designed for post-tr
   <img src="docs/source-en/_static/svg/overview.svg" alt="RLinf-overview"/>
 </div>
 
+## Singularity quickstart (wm_rl_vla)
+
+To reproduce the MBPO+VLA run used here:
+1. Build the image: `singularity build ~/wm_rl_vla.sif singularity/wm_rl_vla.def`
+2. (Once) download required weights into `pretrained_models/`:
+   - `git clone https://huggingface.co/RLinf/RLinf-Pi05-SFT pretrained_models/RLinf-Pi05-SFT`
+   - Download ivideogpt tokenizer/transformer into `iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/{tokenizer,transformer}`
+3. Execute inside the SIF (single GPU example):  
+   `singularity exec --nv --writable-tmpfs ~/wm_rl_vla.sif env MBPO_GPU=0 VLA_GPUS=0 RAY_NUM_GPUS=1 RAY_NUM_CPUS=8 RAY_OBJ_STORE_BYTES=2147483648 START_RAY=0 SCRATCH=/tmp WANDB_API_KEY='' bash examples/embodiment/run_wm_rl_vla.sh`
+
+Notes:
+- `--writable-tmpfs` lets the run create symlinks for LIBERO assets inside the container.
+- `.singularity_pkgs/` contains local overlay installs (e.g., peft) used during debugging; it is not required on the server if the SIF already has the needed packages and can be ignored for commits.
+
 
 ## What's NEW!
 - [2025/11] 🔥 RLinf supports reinforcement learning fine-tuning for [Behavior 1k](https://github.com/StanfordVL/BEHAVIOR-1K). Doc: [RL on Behavior 1k](https://rlinf.readthedocs.io/en/latest/rst_source/examples/behavior.html) 

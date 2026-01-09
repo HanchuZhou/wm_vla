@@ -19,3 +19,4 @@ rlinf/envs/maniskill/assets
 pretrained_models/
 *.sbatch
 log_mbrl
+.singularity_*

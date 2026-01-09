@@ -219,6 +219,11 @@ class ExtendedTimeStepWrapper(dm_env.Environment):
         if action is None:
             action_spec = self.action_spec()
             action = np.zeros(action_spec.shape, dtype=action_spec.dtype)
+        else:
+            action = np.asarray(action)
+            # Drop a leading batch dim when it is 1 so it matches the spec shape.
+            if action.ndim > 1 and action.shape[0] == 1:
+                action = action.reshape(-1)
         return ExtendedTimeStep(observation=time_step.observation,
                                 step_type=time_step.step_type,
                                 action=action,

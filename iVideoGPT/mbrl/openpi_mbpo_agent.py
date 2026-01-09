@@ -39,6 +39,7 @@ class OpenPiMBPOAgent:
             {
                 "model_name": "openpi",
                 "precision": None,
+                "is_lora": openpi.get("is_lora", False) if isinstance(openpi, dict) else False,
                 "openpi": openpi,
             }
         )
@@ -105,10 +106,11 @@ class OpenPiMBPOAgent:
             )
         # openpi outputs chunked actions; take the first action
         action = actions[:, 0].astype(np.float32)
+        action_batch = action  # shape (batch, action_dim)
         if not return_info:
-            return action[0]
+            return action_batch
         info = self._pack_policy_info(result)
-        return action[0], info
+        return action_batch, info
 
     def act2(self, obs, step, eval_mode=False, return_info=False):
         env_obs = self._prepare_env_obs(obs)

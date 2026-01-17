@@ -6,14 +6,14 @@ REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export REPO_PATH
 export PRETRAINED_ROOT="${REPO_PATH}/pretrained_models"
 
-MBPO_TASK_NAME="${MBPO_TASK_NAME:-libero_10}"
-MBPO_FRAMES="${MBPO_FRAMES:-1000002}"
+MBPO_TASK_NAME="${MBPO_TASK_NAME:-PutOnPlateInScene25Main-v3}"
+MBPO_FRAMES="${MBPO_FRAMES:-3000000}"
 MBPO_DEMO="${MBPO_DEMO:-false}"
 MBPO_GPU="${MBPO_GPU:-0}"
-MBPO_CONFIG="${MBPO_CONFIG:-libero_10_mbpo_openpi_pi05_config}"
+MBPO_CONFIG="${MBPO_CONFIG:-maniskill_mbpo_openpi_config}"
 MBPO_EXTRA_ARGS_STR="${MBPO_EXTRA_ARGS:-}"
 
-VLA_CONFIG="${VLA_CONFIG:-libero_10_grpo_openpi_pi05}"
+VLA_CONFIG="${VLA_CONFIG:-maniskill_ppo_openvlaoft}"
 VLA_GPUS="${VLA_GPUS:-0,1,2}"
 RAY_NUM_GPUS="${RAY_NUM_GPUS:-}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-16}"
@@ -52,14 +52,6 @@ if command -v link_assets >/dev/null 2>&1; then
   link_assets || true
 fi
 
-LIBERO_PKG_ROOT="/opt/venv/openpi/lib/python3.11/site-packages/libero/libero"
-LIBERO_SRC_ROOT="/opt/libero/libero/libero"
-for sub in assets bddl_files init_files; do
-  if [[ ! -d "${LIBERO_PKG_ROOT}/${sub}" && -d "${LIBERO_SRC_ROOT}/${sub}" ]]; then
-    ln -sfn "${LIBERO_SRC_ROOT}/${sub}" "${LIBERO_PKG_ROOT}/${sub}" 2>/dev/null || echo "Warning: unable to link ${sub}; run with --writable-tmpfs or bind the path into the container." >&2
-  fi
-done
-
 if [[ "${SKIP_MBRL:-0}" != "1" ]]; then
   echo "[mbpo] task=${MBPO_TASK_NAME} config=${MBPO_CONFIG} gpu=${MBPO_GPU} frames=${MBPO_FRAMES}"
   if command -v switch_env >/dev/null 2>&1; then
@@ -86,7 +78,7 @@ if [[ "${SKIP_MBRL:-0}" != "1" ]]; then
   fi
 
   CUDA_VISIBLE_DEVICES="${MBPO_GPU}" \
-    python "${REPO_PATH}/iVideoGPT/mbrl/train_libero_mbpo_openpi.py" \
+    python "${REPO_PATH}/iVideoGPT/mbrl/train_maniskill_mbpo_openpi.py" \
     --config-name "${MBPO_CONFIG}" \
     task_name="${MBPO_TASK_NAME}" \
     num_train_frames="${MBPO_FRAMES}" \

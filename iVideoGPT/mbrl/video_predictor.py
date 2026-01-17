@@ -123,7 +123,8 @@ class VideoPredictor(nn.Module):
             weight_decay=args.tok_wd,
             eps=1e-8,
         )
-        self.tok_scaler = torch.cuda.amp.GradScaler()
+        use_grad_scaler = os.environ.get("USE_GRAD_SCALER", "0").lower() in {"1", "true", "yes", "y", "on"}
+        self.tok_scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
 
         # prepare for model training
         no_decay = []
@@ -147,7 +148,7 @@ class VideoPredictor(nn.Module):
             },
         ]
         self.model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.model_lr)
-        self.model_scaler = torch.cuda.amp.GradScaler()
+        self.model_scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
 
     def train(self, batch, update_tokenizer=True, update_model=True):
         start = time.time()
@@ -265,7 +266,7 @@ class VideoPredictor(nn.Module):
         }
 
     @torch.no_grad()
-    def rollout(self, obs, policy, horizon):
+    def rollout(self, obs, policy, horizon, do_sample=True):
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             B = obs.shape[0]
             args = self.args
@@ -295,9 +296,15 @@ class VideoPredictor(nn.Module):
                 action_embeds = self.model.action_linear(action)
                 embeds[:, -1] += action_embeds
 
+                attention_mask = torch.ones(
+                    embeds.shape[:2],
+                    device=embeds.device,
+                    dtype=torch.long,
+                )
                 result = self.model.llm.generate(
                     inputs_embeds=embeds,
-                    do_sample=True,
+                    attention_mask=attention_mask,
+                    do_sample=do_sample,
                     temperature=1.0,
                     pad_token_id=50256,
                     top_k=100,

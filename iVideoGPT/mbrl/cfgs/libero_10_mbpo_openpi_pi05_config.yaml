@@ -1,0 +1,156 @@
+defaults:
+  - _self_
+  - override hydra/launcher: submitit_local
+
+name: "0"
+
+repo_root: ${oc.env:REPO_PATH,/home/ucdavis/wm_vla}
+pretrained_root: ${oc.env:PRETRAINED_ROOT,${repo_root}/pretrained_models}
+
+task_name: libero_10
+frame_stack: 3
+action_repeat: 1
+discount: 0.99
+num_train_frames: 1000002
+num_seed_frames: 2000
+eval_every_frames: 1000
+num_eval_episodes: 5
+
+save_snapshot: true
+replay_buffer_size: 1000000
+replay_buffer_num_workers: 1
+nstep: 3
+batch_size: 256
+demo_path_prefix: ${repo_root}/iVideoGPT/mbrl/demonstrations
+demo: false
+
+seed: 1
+device: cuda
+image_size: 64
+save_video: true
+save_train_video: false
+use_tb: ${oc.env:USE_TB,false}
+gif_save_every_frames: 1000
+max_gifs_per_type: 3
+max_eval_videos: 3
+
+experiment: exp
+exp_name: libero_10_mbpo_openpi_pi05
+
+agent_update_times: 2
+
+agent:
+  _target_: openpi_mbpo_agent.OpenPiMBPOAgent
+  device: ${device}
+  model_path: ${pretrained_root}/RLinf-Pi05-SFT
+  lr: 5.0e-6
+  weight_decay: 0.0
+  batch_size: 64
+  update_epochs: 1
+  clip_ratio: 0.2
+  value_coef: 0.5
+  max_buffer_size: 50000
+  gamma: ${discount}
+  openpi:
+    pi05: true
+    simulator_type: libero
+    is_lora: false
+    noise_level: 0.5
+    action_chunk: 10
+    num_steps: 5
+    train_expert_only: true
+    noise_method: "flow_sde"
+    add_value_head: true
+    value_after_vlm: false
+    value_vlm_mode: "mean_token"
+
+gen_every_steps: 200
+gen_batch: 32
+gen_horizon: 10
+update_gen_every_step: 10
+update_tokenizer_every_step: 40
+update_gen_times: 1
+init_update_gen_steps: 1000
+init_gen_times: 20
+real_ratio: 0.5
+start_mbpo: 4000
+
+world_model:
+  load_pretrained_model: true
+  config_name: ${repo_root}/iVideoGPT/configs/llama/config.json
+  vqgan_type: ctx_vqgan
+  pretrained_model_name_or_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/tokenizer
+  pretrained_transformer_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/transformer
+  load_internal_llm: true
+  llama_attn_drop: 0.1
+  fast_reward_predictor: false
+  symlog: true
+
+  context_length: 2
+  segment_length: 12
+  action_dim: ${env.action_dim}
+
+  batch_size: 16
+  selected_params: true
+  tok_lr: 1e-4
+  tok_wd: 0.0
+  tok_beta1: 0.9
+  tok_beta2: 0.999
+  max_grad_norm: 1.0
+  max_target_frames: 5
+
+  model_lr: 1e-4
+  model_wd: 0.0
+  embed_no_wd: true
+
+  reward_lr: 1e-4
+  reward_wd: 1e-6
+  reward_weight: 1.0
+
+env:
+  task_suite_name: libero_10
+  action_dim: 7
+  auto_reset: false
+  ignore_terminations: false
+  max_episode_steps: 480
+  use_rel_reward: true
+  reward_coef: 1.0
+  only_eval: false
+  seed: ${seed}
+  num_group: 1
+  group_size: 1
+  use_fixed_reset_state_ids: true
+  use_wrist_image: true
+  num_envs: 1
+  video_cfg:
+    save_video: true
+    info_on_video: true
+    video_base_dir: ./video/train
+  init_params:
+    camera_heights: 64
+    camera_widths: 64
+  use_ordered_reset_state_ids: false
+
+wandb:
+  enable: true
+  entity: flare-robot
+  team: flare-robot
+  org: ucd-dare
+  project: ${task_name}
+  group: ${exp_name}
+  mode: online
+
+hydra:
+  run:
+    dir: ./log_mbrl/${now:%Y.%m.%d}/${exp_name}_${task_name}_${now:%H%M%S}
+  sweep:
+    dir: ./exp/${now:%Y.%m.%d}/${now:%H%M}_${exp_name}_${task_name}
+    subdir: ${hydra.job.num}
+  launcher:
+    timeout_min: 4300
+    cpus_per_task: 10
+    gpus_per_node: 1
+    tasks_per_node: 1
+    mem_gb: 160
+    nodes: 1
+    submitit_folder: ./exp/${now:%Y.%m.%d}/${now:%H%M%S}_${exp_name}/.slurm

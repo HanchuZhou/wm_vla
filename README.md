@@ -31,12 +31,17 @@ RLinf is a flexible and scalable open-source infrastructure designed for post-tr
 ## Singularity quickstart (wm_rl_vla)
 
 To reproduce the MBPO+VLA run used here:
-1. Build the image: `singularity build ~/wm_rl_vla.sif singularity/wm_rl_vla.def`
-2. (Once) download required weights into `pretrained_models/`:
-   - `git clone https://huggingface.co/RLinf/RLinf-Pi05-SFT pretrained_models/RLinf-Pi05-SFT`
-   - Download ivideogpt tokenizer/transformer into `iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/{tokenizer,transformer}`
+1. Initialize: 
+```bash
+bash --login
+module load singularity	
+unset LD_PRELOAD
+```
+2. Build the image: `singularity build ~/wm_rl_vla.sif singularity/wm_rl_vla.def`
 3. Execute inside the SIF (single GPU example):  
-   `singularity exec --nv --writable-tmpfs ~/wm_rl_vla.sif env MBPO_GPU=0 VLA_GPUS=0 RAY_NUM_GPUS=1 RAY_NUM_CPUS=8 RAY_OBJ_STORE_BYTES=2147483648 START_RAY=0 SCRATCH=/tmp WANDB_API_KEY='' bash examples/embodiment/run_wm_rl_vla.sh`
+   `singularity exec --nv --writable-tmpfs ~/wm_rl_vla.sif env MUJOCO_GL=osmesa USE_TF=0 USE_TB=0 MBPO_GPU=0 VLA_GPUS=0 RAY_NUM_GPUS=1 RAY_NUM_CPUS=8 RAY_OBJ_STORE_BYTES=2147483648 START_RAY=0 SCRATCH=/tmp WANDB_API_KEY='' bash examples/embodiment/run_wm_rl_vla.sh`
+   If EGL initialization fails (e.g., headless GPU driver missing `EGL_EXT_platform_device`), retry with software rendering: set `MUJOCO_GL=osmesa`.
+   If you hit TensorFlow import segfaults inside transformers, keep `USE_TF=0` (default) and optionally set `USE_TB=0` to disable TensorBoard.
 
 Notes:
 - `--writable-tmpfs` lets the run create symlinks for LIBERO assets inside the container.

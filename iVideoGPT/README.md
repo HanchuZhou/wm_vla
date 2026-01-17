@@ -85,8 +85,8 @@ Run the MBPO + iVideoGPT pipeline on ManiSkill tasks from the repository root:
    ```bash
    # PickCube-v1
    python iVideoGPT/mbrl/scripts/collect_maniskill_demo.py \
-       --task PickCube-v1 \
-       --trajectory_path iVideoGPT/mbrl/demonstrations/PickCube-v1/rl/trajectory.none.pd_ee_delta_pose.physx_cuda.h5 \
+       --task StackCube-v1 \
+       --trajectory_path iVideoGPT/mbrl/demonstrations/StackCube-v1/rl/trajectory.none.pd_ee_delta_pose.physx_cuda.h5 \
        --episodes 5 --success_only --obj_set null --max_episode_steps 50
    ```
 

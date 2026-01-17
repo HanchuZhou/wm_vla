@@ -14,6 +14,7 @@
 
 from collections import defaultdict
 from typing import Any
+import os
 
 import numpy as np
 import torch
@@ -70,6 +71,13 @@ class EnvWorker(Worker):
             self.channel = self.connect_channel(cfg.env.channel.name)
 
     def init_worker(self):
+        # Ensure MUJOCO_EGL_DEVICE_ID matches the local CUDA_VISIBLE_DEVICES for EGL.
+        if os.getenv("MUJOCO_GL") == "egl":
+            cuda_visible = os.getenv("CUDA_VISIBLE_DEVICES", "")
+            if cuda_visible:
+                first_device = cuda_visible.split(",")[0].strip()
+                if first_device and os.getenv("MUJOCO_EGL_DEVICE_ID") not in cuda_visible.split(","):
+                    os.environ["MUJOCO_EGL_DEVICE_ID"] = first_device
         enable_offload = self.cfg.env.enable_offload
         only_eval = getattr(self.cfg.runner, "only_eval", False)
         if self.cfg.env.train.simulator_type == "maniskill":

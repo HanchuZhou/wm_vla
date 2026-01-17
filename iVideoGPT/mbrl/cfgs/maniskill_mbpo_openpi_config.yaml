@@ -1,0 +1,146 @@
+defaults:
+  - _self_
+  - task: maniskill/put_on_plate_main
+  - override hydra/launcher: submitit_local
+
+name: "0"
+
+# task settings
+task_name: ${task.task_name}
+frame_stack: ${task.frame_stack}
+action_repeat: ${task.action_repeat}
+discount: 0.99
+num_train_frames: ${task.num_train_frames}
+num_seed_frames: ${task.num_seed_frames}
+eval_every_frames: ${task.eval_every_frames}
+num_eval_episodes: ${task.num_eval_episodes}
+
+save_snapshot: true
+replay_buffer_size: 1000000
+replay_buffer_num_workers: 1
+nstep: 3
+batch_size: 256
+demo_path_prefix: ${repo_root}/iVideoGPT/mbrl/demonstrations
+demo: false
+
+seed: 1
+device: cuda
+save_video: true
+save_train_video: false
+use_tb: ${oc.env:USE_TB,false}
+gif_save_every_frames: 500
+max_gifs_per_type: 3
+max_eval_videos: 3
+
+repo_root: ${oc.env:REPO_PATH,/home/ucdavis/wm_vla}
+pretrained_root: ${oc.env:PRETRAINED_ROOT,${repo_root}/pretrained_models}
+
+experiment: exp
+exp_name: maniskill_mbpo_openpi
+
+agent_update_times: 2
+
+agent:
+  _target_: openpi_mbpo_agent.OpenPiMBPOAgent
+  device: ${device}
+  model_path: ${pretrained_root}/RLinf-Pi05-SFT
+  lr: 5.0e-6
+  weight_decay: 0.0
+  batch_size: 64
+  update_epochs: 1
+  clip_ratio: 0.2
+  value_coef: 0.5
+  max_buffer_size: 50000
+  gamma: ${discount}
+  openpi:
+    pi05: true
+    simulator_type: maniskill
+    is_lora: false
+    noise_level: 0.5
+    action_chunk: 10
+    num_steps: 5
+    train_expert_only: true
+    noise_method: "flow_sde"
+    add_value_head: true
+    value_after_vlm: false
+    value_vlm_mode: "mean_token"
+    action_env_dim: 7
+
+gen_every_steps: 200
+gen_batch: 32
+gen_horizon: 10
+update_gen_every_step: 10
+update_tokenizer_every_step: 40
+update_gen_times: 1
+init_update_gen_steps: 1000
+init_gen_times: 20
+real_ratio: 0.5
+start_mbpo: 4000
+
+world_model:
+  load_pretrained_model: true
+  config_name: ${repo_root}/iVideoGPT/configs/llama/config.json
+  vqgan_type: ctx_vqgan
+  pretrained_model_name_or_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/tokenizer
+  pretrained_transformer_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/transformer
+  load_internal_llm: true
+  llama_attn_drop: 0.1
+  fast_reward_predictor: false
+  symlog: true
+
+  context_length: 2
+  segment_length: 12
+  action_dim: 7
+
+  batch_size: 16
+  selected_params: true
+  tok_lr: 1e-4
+  tok_wd: 0.0
+  tok_beta1: 0.9
+  tok_beta2: 0.999
+  max_grad_norm: 1.0
+  max_target_frames: 5
+
+  model_lr: 1e-4
+  model_wd: 0.0
+  embed_no_wd: true
+
+  reward_lr: 1e-4
+  reward_wd: 1e-6
+  reward_weight: 1.0
+
+# maniskill settings
+obs_mode: rgb+segmentation
+control_mode: ${task.control_mode}
+sim_backend: gpu
+sim_freq: 500
+control_freq: 5
+max_episode_steps: ${task.max_episode_steps}
+obj_set: ${task.obj_set}
+render_mode: rgb_array
+shader_pack: default
+render_backend: gpu
+
+wandb:
+  enable: true
+  entity: flare-robot
+  team: flare-robot
+  org: ucd-dare
+  project: ${task_name}
+  group: ${exp_name}
+  mode: online
+
+hydra:
+  run:
+    dir: ./log_mbrl/${now:%Y.%m.%d}/${exp_name}_${task_name}_${now:%H%M%S}
+  sweep:
+    dir: ./exp/${now:%Y.%m.%d}/${now:%H%M}_${exp_name}_${task_name}
+    subdir: ${hydra.job.num}
+  launcher:
+    timeout_min: 4300
+    cpus_per_task: 10
+    gpus_per_node: 1
+    tasks_per_node: 1
+    mem_gb: 160
+    nodes: 1
+    submitit_folder: ./exp/${now:%Y.%m.%d}/${now:%H%M%S}_${exp_name}/.slurm

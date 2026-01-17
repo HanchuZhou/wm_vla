@@ -4,8 +4,8 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/train_embodied_agent.py"
 
-export MUJOCO_GL="egl"
-export PYOPENGL_PLATFORM="egl"
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 
 # NOTE: set LIBERO_REPO_PATH to the path of the LIBERO repo
 export LIBERO_REPO_PATH="/opt/libero"
@@ -35,6 +35,13 @@ echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
-echo ${CMD} > ${MEGA_LOG_FILE}
-${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+EXTRA_ARGS=()
+if [[ -n "${EMBODIMENT_EXTRA_ARGS:-}" ]]; then
+    read -r -a EXTRA_ARGS <<< "${EMBODIMENT_EXTRA_ARGS}"
+fi
+CMD=(python "${SRC_FILE}" --config-path "${EMBODIED_PATH}/config/" --config-name "${CONFIG_NAME}" runner.logger.log_path="${LOG_DIR}")
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    CMD+=("${EXTRA_ARGS[@]}")
+fi
+echo "${CMD[@]}" > "${MEGA_LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee -a "${MEGA_LOG_FILE}"

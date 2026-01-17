@@ -7,7 +7,12 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import os
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-os.environ['MUJOCO_GL'] = 'egl'
+os.environ.setdefault('MUJOCO_GL', 'egl')
+if os.environ.get("DUMP_STACK_ON_HANG") == "1":
+    import faulthandler
+    import sys
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(60, repeat=True, file=sys.stderr)
 
 from pathlib import Path
 
@@ -67,6 +72,7 @@ class Workspace:
         self._global_episode = 0
         self._global_imag_step = 0  # counts how often generate() runs
         self._global_imag_transitions = 0  # cumulative imagined transitions
+        self._current_task_descriptions = None
 
     def _init_wandb(self):
         wb_cfg = getattr(self.cfg, 'wandb', None)
@@ -225,10 +231,13 @@ class Workspace:
         step, episode, total_reward, total_success = 0, 0, 0, 0
         eval_until_episode = drq_utils.Until(self.cfg.num_eval_episodes, bar_name='eval_eps')
         eval_action_norms = []
-        eval_frame_deltas = []
+        debug_task_desc = os.environ.get("DEBUG_TASK_DESC") == "1"
 
         while eval_until_episode(episode):
             time_step = self.eval_env.reset()
+            if debug_task_desc and isinstance(time_step.state, dict):
+                task_desc = time_step.state.get("task_descriptions", None)
+                print(f"[eval] task_descriptions: {task_desc}")
             episode_success = 0
             prev_pixels = time_step.observation[-3:].copy()
             record_episode = (episode < self.max_eval_videos) and self.should_save_gif(self.global_frame)
@@ -241,10 +250,7 @@ class Workspace:
                 action_norm = float(np.linalg.norm(action))
                 eval_action_norms.append(action_norm)
                 time_step = self.eval_env.step(action)
-                curr_pixels = time_step.observation[-3:].copy()
-                frame_delta = float(np.mean(np.abs(curr_pixels - prev_pixels)))
-                eval_frame_deltas.append(frame_delta)
-                prev_pixels = curr_pixels
+                prev_pixels = time_step.observation[-3:].copy()
                 self.video_recorder.record(self.eval_env, time_step.reward)
                 total_reward += time_step.reward
                 episode_success += time_step.success
@@ -267,21 +273,15 @@ class Workspace:
         }
         if eval_action_norms:
             action_norms = np.array(eval_action_norms)
-            frame_deltas = np.array(eval_frame_deltas) if eval_frame_deltas else np.array([0.0])
             eval_logs.update(
                 {
                     "action_norm_mean": action_norms.mean(),
                     "action_norm_min": action_norms.min(),
                     "action_norm_max": action_norms.max(),
-                    "obs_delta_mean": frame_deltas.mean(),
-                    "obs_delta_min": frame_deltas.min(),
-                    "obs_delta_max": frame_deltas.max(),
                     "zero_action_frac": float(np.mean(action_norms < 1e-3)),
-                    "still_frame_frac": float(np.mean(frame_deltas < 1.0)),
                 }
             )
             print(f"[eval] action_norm mean={action_norms.mean():.4f}, min={action_norms.min():.4f}, max={action_norms.max():.4f}")
-            print(f"[eval] frame_delta mean={frame_deltas.mean():.4f}, min={frame_deltas.min():.4f}, max={frame_deltas.max():.4f}")
 
         with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
             for k, v in eval_logs.items():
@@ -302,7 +302,11 @@ class Workspace:
 
         def policy(obs, step):
             action, info = self.agent.act2(
-                obs, self.global_step - 1, eval_mode=False, return_info=True
+                obs,
+                self.global_step - 1,
+                eval_mode=False,
+                return_info=True,
+                task_descriptions=self._current_task_descriptions,
             )
             policy_infos.append(info)
             return action
@@ -362,6 +366,9 @@ class Workspace:
         }
 
     def validate(self, global_frame):
+        if self.replay_storage._num_episodes == 0:
+            print("[stage] validate skipped (empty replay buffer)")
+            return {}
         if self._seg_replay_iter is None:
             self._seg_replay_iter = iter(self.seg_replay_loader)
         batch = next(self._seg_replay_iter)
@@ -374,6 +381,7 @@ class Workspace:
             obs_gt[:, 0], 
             policy,
             obs_gt.shape[1] - 1,
+            do_sample=False,
         )
         obs_mse = ((obs_pred[:, 1:] - (obs_gt[:, 1:]/255.).to(obs_pred.device)) ** 2).mean()
         reward_mse = ((reward_pred[:, 1:] - reward_gt[:, 1:].to(reward_pred.device)) ** 2).mean()
@@ -431,6 +439,8 @@ class Workspace:
 
         episode_step, episode_reward, episode_success = 0, 0, 0
         time_step = self.train_env.reset()
+        if isinstance(time_step.state, dict) and "task_descriptions" in time_step.state:
+            self._current_task_descriptions = time_step.state["task_descriptions"]
         self.replay_storage.add(time_step)
         self.train_video_recorder.init(time_step.observation)
         metrics = None
@@ -457,6 +467,8 @@ class Workspace:
 
                 # reset env
                 time_step = self.train_env.reset()
+                if isinstance(time_step.state, dict) and "task_descriptions" in time_step.state:
+                    self._current_task_descriptions = time_step.state["task_descriptions"]
                 self.replay_storage.add(time_step)
                 self.train_video_recorder.init(time_step.observation)
                 # try to save snapshot
@@ -485,12 +497,18 @@ class Workspace:
                     eval_mode=False,
                     return_info=True,
                 )
+            if isinstance(time_step.state, dict) and "task_descriptions" in time_step.state:
+                self._current_task_descriptions = time_step.state["task_descriptions"]
 
             # try to update the agent
             if not seed_until_step(self.global_step):
                 if not init_model:
+                    print("[stage] init world model update")
                     # init train the model
                     for _ in trange(self.cfg.init_update_gen_steps):
+                        if self.replay_storage._num_episodes == 0:
+                            print("[stage] init world model update skipped (empty replay buffer)")
+                            break
                         if self._seg_replay_iter is None:
                             self._seg_replay_iter = iter(self.seg_replay_loader)
                         batch = next(self._seg_replay_iter)
@@ -505,8 +523,13 @@ class Workspace:
 
                     init_model = True
                 else:
+                    if update_gen_every_step(self.global_step):
+                        print("[stage] update world model")
                     # update the model
                     if update_gen_every_step(self.global_step):
+                        if self.replay_storage._num_episodes == 0:
+                            print("[stage] update world model skipped (empty replay buffer)")
+                            break
                         for _ in range(self.cfg.update_gen_times):
                             if self._seg_replay_iter is None:
                                 self._seg_replay_iter = iter(self.seg_replay_loader)
@@ -515,6 +538,7 @@ class Workspace:
                         self.logger.log_metrics(metrics, self.global_frame, ty='train')
                 
                 if self.global_step * self.cfg.action_repeat >= self.cfg.start_mbpo and not init_gen:
+                    print("[stage] init imagined rollouts")
                     for _ in trange(self.cfg.init_gen_times):
                         metrics = self.generate()
                         self.logger.log_metrics(metrics, self.global_frame, ty='train')
@@ -526,6 +550,7 @@ class Workspace:
                 
                 # generate fake transitions
                 if self.global_step * self.cfg.action_repeat >= self.cfg.start_mbpo and gen_every_step(self.global_step):
+                    print("[stage] imagined rollouts")
                     metrics = self.generate()
                     self.logger.log_metrics(metrics, self.global_frame, ty='train')
 
@@ -562,7 +587,7 @@ class Workspace:
             self.__dict__[k] = v
 
 
-@hydra.main(config_path='cfgs', config_name='libero_mbpo_openpi_config')
+@hydra.main(config_path='cfgs', config_name='libero_10_mbpo_openpi_pi05_config')
 def main(cfg):
     root_dir = Path.cwd()
     workspace = Workspace(cfg)

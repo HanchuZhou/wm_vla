@@ -7,13 +7,13 @@ name: "0"
 repo_root: ${oc.env:REPO_PATH,/home/ucdavis/wm_vla}
 pretrained_root: ${oc.env:PRETRAINED_ROOT,${repo_root}/pretrained_models}
 
-task_name: libero_10
+task_name: libero_spatial
 frame_stack: 3
 action_repeat: 1
 discount: 0.99
 num_train_frames: 1000002
 num_seed_frames: 2000
-eval_every_frames: 10000
+eval_every_frames: 1000
 num_eval_episodes: 5
 
 save_snapshot: true
@@ -27,15 +27,15 @@ demo: false
 seed: 1
 device: cuda
 image_size: 64
-save_video: false
+save_video: true
 save_train_video: false
-use_tb: true
-gif_save_every_frames: 30000
+use_tb: ${oc.env:USE_TB,false}
+gif_save_every_frames: 1000
 max_gifs_per_type: 3
 max_eval_videos: 3
 
 experiment: exp
-exp_name: libero_mbpo_openpi
+exp_name: libero_spatial_mbpo_openpi_pi05
 
 agent_update_times: 2
 
@@ -108,11 +108,11 @@ world_model:
   reward_weight: 1.0
 
 env:
-  task_suite_name: libero_10
+  task_suite_name: libero_spatial
   action_dim: 7
   auto_reset: false
   ignore_terminations: false
-  max_episode_steps: 480
+  max_episode_steps: 240
   use_rel_reward: true
   reward_coef: 1.0
   only_eval: false
@@ -127,8 +127,8 @@ env:
     info_on_video: true
     video_base_dir: ./video/train
   init_params:
-    camera_heights: 256
-    camera_widths: 256
+    camera_heights: 64
+    camera_widths: 64
   use_ordered_reset_state_ids: false
 
 wandb:

@@ -71,7 +71,11 @@ class OpenPiMBPOAgent:
         return value.reshape(value.shape[0], -1).mean(dim=1)
 
     def _prepare_env_obs(
-        self, obs: Any, frame_stack: int = 3, use_wrist: bool = True
+        self,
+        obs: Any,
+        frame_stack: int = 3,
+        use_wrist: bool = True,
+        task_descriptions: Optional[list[str]] = None,
     ) -> Dict[str, Any]:
         if isinstance(obs, dict):
             return obs
@@ -88,18 +92,22 @@ class OpenPiMBPOAgent:
                 image = image * 255.0
         image = image.to(torch.uint8)
         state = torch.zeros((image.shape[0], self.action_dim), dtype=torch.float32)
+        if task_descriptions is None:
+            task_descriptions = [""] * image.shape[0]
+        elif len(task_descriptions) == 1 and image.shape[0] > 1:
+            task_descriptions = task_descriptions * image.shape[0]
         env_obs = {
             "images": image.cpu(),
             "states": state,
-            "task_descriptions": [""] * image.shape[0],
+            "task_descriptions": task_descriptions,
         }
         if use_wrist:
             env_obs["wrist_images"] = image.cpu()
         return env_obs
 
-    def act(self, obs, step, eval_mode=False, return_info=False):
+    def act(self, obs, step, eval_mode=False, return_info=False, task_descriptions=None):
         self.model.eval()
-        env_obs = self._prepare_env_obs(obs)
+        env_obs = self._prepare_env_obs(obs, task_descriptions=task_descriptions)
         with torch.no_grad():
             actions, result = self.model.predict_action_batch(
                 env_obs=env_obs, mode="eval" if eval_mode else "train"
@@ -112,8 +120,8 @@ class OpenPiMBPOAgent:
         info = self._pack_policy_info(result)
         return action_batch, info
 
-    def act2(self, obs, step, eval_mode=False, return_info=False):
-        env_obs = self._prepare_env_obs(obs)
+    def act2(self, obs, step, eval_mode=False, return_info=False, task_descriptions=None):
+        env_obs = self._prepare_env_obs(obs, task_descriptions=task_descriptions)
         with torch.no_grad():
             actions, result = self.model.predict_action_batch(
                 env_obs=env_obs, mode="eval" if eval_mode else "train"

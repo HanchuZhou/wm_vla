@@ -165,6 +165,12 @@ class Libero(dm_env.Environment):
             state=policy_obs,
         )
 
+    def render(self):
+        """Return the latest RGB frame for video recorders."""
+        if self._last_obs is None:
+            self.reset()
+        return self._last_obs
+
 
 def make(cfg, frame_stack, action_repeat, seed, image_size=(64, 64)):
     env = Libero(cfg, seed=seed, action_repeat=action_repeat, size=image_size)

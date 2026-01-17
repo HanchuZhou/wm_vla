@@ -4,13 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 import csv
 import datetime
+import os
 from collections import defaultdict
 
 import numpy as np
 import torch
 import torchvision
 from termcolor import colored
-from torch.utils.tensorboard import SummaryWriter
 
 try:
     import wandb  # type: ignore
@@ -130,15 +130,21 @@ class MetersGroup(object):
 
 class Logger(object):
     def __init__(self, log_dir, use_tb, wandb_run=None):
+        if isinstance(use_tb, str):
+            use_tb = use_tb.strip().lower() in {"1", "true", "yes", "y", "on"}
         self._log_dir = log_dir
         self._train_mg = MetersGroup(log_dir / 'train.csv',
                                      formating=COMMON_TRAIN_FORMAT)
         self._eval_mg = MetersGroup(log_dir / 'eval.csv',
                                     formating=COMMON_EVAL_FORMAT)
-        if use_tb:
-            self._sw = SummaryWriter(str(log_dir / 'tb'))
-        else:
-            self._sw = None
+        self._sw = None
+        if use_tb and os.environ.get("DISABLE_TENSORBOARD") != "1":
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except Exception:
+                self._sw = None
+            else:
+                self._sw = SummaryWriter(str(log_dir / 'tb'))
         self._wandb = wandb_run
         self._wandb_buffer = {}
         self._wandb_step = None

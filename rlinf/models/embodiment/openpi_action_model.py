@@ -139,6 +139,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
                 if value
                 in ["observation/image", "observation/wrist_image", "observation/state"]
             }
+        if "observation/state" in inputs:
+            state = inputs["observation/state"]
+            if hasattr(state, "ndim") and state.ndim > 2:
+                if state.shape[1] == 1:
+                    state = state[:, 0]
+                else:
+                    state = state.reshape(state.shape[0], -1)
+                inputs["observation/state"] = state
+        for key in ("tokenized_prompt", "tokenized_prompt_mask"):
+            if key in inputs:
+                token = inputs[key]
+                if hasattr(token, "ndim") and token.ndim > 2 and token.shape[1] == 1:
+                    inputs[key] = token[:, 0]
         # tensor -> numpy
         inputs = jax.tree.map(
             lambda x: np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x, inputs
@@ -146,18 +159,37 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
         batch_size = next(v.shape[0] for v in inputs.values() if hasattr(v, "shape"))
         # split & transform
         transformed_samples = []
+        def _normalize_image_array(x: np.ndarray) -> np.ndarray:
+            if not hasattr(x, "ndim"):
+                return x
+            if x.ndim == 4:
+                # If a time dimension is present, keep the most recent frame.
+                if x.shape[0] not in {1, 3} and x.shape[-1] in {1, 3}:
+                    x = x[-1]
+                elif x.shape[1] in {1, 3} and x.shape[-1] not in {1, 3}:
+                    x = x[-1]
+                # Handle (T, C, H, W) -> (T, H, W, C) for PIL transforms.
+                if x.ndim == 4 and x.shape[1] in {1, 3} and x.shape[-1] not in {1, 3}:
+                    x = x.transpose(0, 2, 3, 1)
+                if x.ndim == 4 and x.shape[-1] == 1:
+                    x = np.repeat(x, 3, axis=-1)
+                return x
+            if x.ndim != 3:
+                return x
+            # Handle (C, H, W) -> (H, W, C).
+            if x.shape[0] in {1, 3} and x.shape[-1] not in {1, 3}:
+                x = x.transpose(1, 2, 0)
+            # Ensure HWC with 3 channels for PIL ops.
+            if x.shape[-1] == 1:
+                x = np.repeat(x, 3, axis=-1)
+            return x
+
         for i in range(batch_size):
             sample = jax.tree.map(lambda x: x[i], inputs)
-            # convert from [3,256,256] -> [256,256,3]
             if transpose:
-                sample = jax.tree.map(
-                    lambda x: x.transpose(1, 2, 0)
-                    if len(x.shape) == 3 and transpose
-                    else x,
-                    sample,
-                )
+                sample = jax.tree.map(_normalize_image_array, sample)
             else:
-                sample = jax.tree.map(lambda x: x if len(x.shape) == 3 else x, sample)
+                sample = jax.tree.map(lambda x: x, sample)
             if first_process:
                 sample["prompt"] = obs["prompt"][i]
             else:
@@ -173,6 +205,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
         if not first_process:
             inputs["tokenized_prompt"] = obs["tokenized_prompt"]
             inputs["tokenized_prompt_mask"] = obs["tokenized_prompt_mask"]
+            for key in ("tokenized_prompt", "tokenized_prompt_mask"):
+                token = inputs.get(key)
+                if hasattr(token, "ndim") and token.ndim > 2 and token.shape[1] == 1:
+                    inputs[key] = token[:, 0]
         return inputs
 
     def output_transform(self, outputs):
@@ -686,7 +722,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
         else:
             lang_length = 48
             all_length = 816
-        if self.config.simulator_type == "metaworld":
+        if self.config.simulator_type in {"metaworld", "maniskill"}:
             camera_num = 1
         elif self.config.simulator_type == "libero":
             camera_num = 2

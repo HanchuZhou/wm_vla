@@ -191,7 +191,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
                 actor_train_config = get_openpi_config("pi05_libero")
             else:
                 actor_train_config = get_openpi_config("pi0_libero")
-        elif simulator_type == "metaworld":
+        elif simulator_type in {"metaworld", "maniskill"}:
             if getattr(cfg.openpi, "pi05", False):
                 actor_train_config = get_openpi_config("pi05_metaworld")
             else:

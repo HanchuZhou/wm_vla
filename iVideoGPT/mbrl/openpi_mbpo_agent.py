@@ -120,6 +120,17 @@ class OpenPiMBPOAgent:
         info = self._pack_policy_info(result)
         return action_batch, info
 
+    def act_chunk(self, obs, step, eval_mode=True, task_descriptions=None):
+        """Return the full action chunk for evaluation."""
+        self.model.eval()
+        env_obs = self._prepare_env_obs(obs, task_descriptions=task_descriptions)
+        with torch.no_grad():
+            actions, _result = self.model.predict_action_batch(
+                env_obs=env_obs, mode="eval" if eval_mode else "train"
+            )
+        actions = np.asarray(actions, dtype=np.float32)
+        return actions
+
     def act2(self, obs, step, eval_mode=False, return_info=False, task_descriptions=None):
         env_obs = self._prepare_env_obs(obs, task_descriptions=task_descriptions)
         with torch.no_grad():
@@ -145,6 +156,15 @@ class OpenPiMBPOAgent:
             info["forward_inputs"][key] = self._detach_nested(value)
         return info
 
+    def _squeeze_nested(self, value):
+        if torch.is_tensor(value):
+            if value.ndim > 0 and value.shape[0] == 1:
+                return value[0]
+            return value
+        if isinstance(value, dict):
+            return {k: self._squeeze_nested(v) for k, v in value.items()}
+        return value
+
     def _detach_nested(self, value):
         if torch.is_tensor(value):
             return value.detach().cpu()
@@ -161,6 +181,7 @@ class OpenPiMBPOAgent:
     ):
         if policy_info is None:
             return
+        policy_info = self._squeeze_nested(policy_info)
         entry = {
             "reward": float(reward),
             "discount": float(discount),
@@ -218,6 +239,7 @@ class OpenPiMBPOAgent:
             data = {k: self._to_device(v) for k, v in data.items()}
             prev_logprobs = prev_logprobs.to(self.device)
             rewards = rewards.to(self.device)
+            data["prev_logprobs"] = prev_logprobs
 
             output = self.model(data, compute_logprobs=True, compute_values=True)
             logprobs = self._reduce_logprob(output["logprobs"])

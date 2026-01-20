@@ -228,46 +228,128 @@ class Workspace:
             yield mix_batch
 
     def eval(self):
-        step, episode, total_reward, total_success = 0, 0, 0, 0
+        if getattr(self.cfg, "num_eval_episodes", 0) <= 0:
+            print("[stage] eval skipped (num_eval_episodes <= 0)")
+            return
+        step, total_reward, total_success = 0, 0, 0
+        episodes_done = 0
+        episodes_started = 0
         eval_until_episode = drq_utils.Until(self.cfg.num_eval_episodes, bar_name='eval_eps')
         eval_action_norms = []
         debug_task_desc = os.environ.get("DEBUG_TASK_DESC") == "1"
+        num_eval_envs = int(getattr(self.cfg.env, "eval_num_envs", self.cfg.env.num_envs))
+        num_eval_envs = max(1, num_eval_envs)
 
-        while eval_until_episode(episode):
-            time_step = self.eval_env.reset()
-            if debug_task_desc and isinstance(time_step.state, dict):
-                task_desc = time_step.state.get("task_descriptions", None)
-                print(f"[eval] task_descriptions: {task_desc}")
-            episode_success = 0
-            prev_pixels = time_step.observation[-3:].copy()
-            record_episode = (episode < self.max_eval_videos) and self.should_save_gif(self.global_frame)
-            self.video_recorder.init(self.eval_env, enabled=record_episode)
-            while not time_step.last():
-                with torch.no_grad(), drq_utils.eval_mode(self.agent):
-                    action = self.agent.act(time_step.state or time_step.observation,
-                                            self.global_step,
-                                            eval_mode=True)
-                action_norm = float(np.linalg.norm(action))
-                eval_action_norms.append(action_norm)
-                time_step = self.eval_env.step(action)
-                prev_pixels = time_step.observation[-3:].copy()
-                self.video_recorder.record(self.eval_env, time_step.reward)
-                total_reward += time_step.reward
-                episode_success += time_step.success
-                step += 1
+        if not hasattr(self, "eval_envs"):
+            self.eval_envs = [self.eval_env]
+        if len(self.eval_envs) != num_eval_envs:
+            image_size = getattr(self.cfg, "image_size", 64)
+            self.eval_envs = [
+                libero_env.make(
+                    self.cfg.env,
+                    self.cfg.frame_stack,
+                    self.cfg.action_repeat,
+                    self.cfg.seed + env_idx,
+                    image_size=(image_size, image_size),
+                )
+                for env_idx in range(num_eval_envs)
+            ]
 
-            total_success += episode_success >= 1.0
-            episode += 1
-            # self.video_recorder.save(f'{self.global_frame}.mp4')
-            if self.video_recorder.enabled:
-                file_name = f'{self.global_frame}_ep{episode - 1}.gif'
-                self.video_recorder.save(file_name)
-                self._log_wandb_gif('eval/gif', self.work_dir / 'eval_video' / file_name)
+        def stack_policy_obs(obs_list):
+            images = torch.cat([obs["images"] for obs in obs_list], dim=0)
+            states = torch.cat([obs["states"] for obs in obs_list], dim=0)
+            task_descs = []
+            for obs in obs_list:
+                task_descs.extend(obs.get("task_descriptions", [""]))
+            batch = {"images": images, "states": states, "task_descriptions": task_descs}
+            if any("wrist_images" in obs for obs in obs_list):
+                batch["wrist_images"] = torch.cat(
+                    [obs.get("wrist_images", obs["images"]) for obs in obs_list], dim=0
+                )
+            return batch
+
+        episode_success = [0.0 for _ in range(num_eval_envs)]
+        env_time_steps = [None for _ in range(num_eval_envs)]
+        video_recorders = [
+            VideoRecorder(self.work_dir if self.cfg.save_video else None)
+            for _ in range(num_eval_envs)
+        ]
+        video_enabled = [False for _ in range(num_eval_envs)]
+        active_envs = [False for _ in range(num_eval_envs)]
+        for env_idx in range(num_eval_envs):
+            if episodes_started >= self.cfg.num_eval_episodes:
+                break
+            env_time_steps[env_idx] = self.eval_envs[env_idx].reset()
+            if debug_task_desc and isinstance(env_time_steps[env_idx].state, dict):
+                task_desc = env_time_steps[env_idx].state.get("task_descriptions", None)
+                print(f"[eval] env{env_idx} task_descriptions: {task_desc}")
+            record_episode = (episodes_started < self.max_eval_videos) and self.should_save_gif(
+                self.global_frame
+            )
+            video_recorders[env_idx].init(self.eval_envs[env_idx], enabled=record_episode)
+            video_enabled[env_idx] = video_recorders[env_idx].enabled
+            active_envs[env_idx] = True
+            episodes_started += 1
+
+        while eval_until_episode(episodes_done) and any(active_envs):
+            obs_batch = [
+                env_time_steps[i].state
+                for i in range(num_eval_envs)
+                if active_envs[i]
+            ]
+            with torch.no_grad(), drq_utils.eval_mode(self.agent):
+                action_chunks = self.agent.act_chunk(
+                    stack_policy_obs(obs_batch),
+                    self.global_step,
+                    eval_mode=True,
+                )
+            action_chunks = np.asarray(action_chunks)
+            if action_chunks.ndim == 2:
+                action_chunks = action_chunks[None, ...]
+
+            active_indices = [i for i in range(num_eval_envs) if active_envs[i]]
+            for batch_idx, env_idx in enumerate(active_indices):
+                chunk = action_chunks[batch_idx]
+                for action in chunk:
+                    action_norm = float(np.linalg.norm(action))
+                    eval_action_norms.append(action_norm)
+                    env_action = action[None, :] if np.asarray(action).ndim == 1 else action
+                    env_time_steps[env_idx] = self.eval_envs[env_idx].step(env_action)
+                    video_recorders[env_idx].record(
+                        self.eval_envs[env_idx], env_time_steps[env_idx].reward
+                    )
+                    total_reward += env_time_steps[env_idx].reward
+                    episode_success[env_idx] += env_time_steps[env_idx].success
+                    step += 1
+                    if env_time_steps[env_idx].last():
+                        episode_id = episodes_done
+                        total_success += episode_success[env_idx] >= 1.0
+                        if video_enabled[env_idx]:
+                            file_name = f"{self.global_frame}_ep{episode_id}.gif"
+                            video_recorders[env_idx].save(file_name)
+                            self._log_wandb_gif(
+                                "eval/gif", self.work_dir / "eval_video" / file_name
+                            )
+                        episode_success[env_idx] = 0.0
+                        episodes_done += 1
+                        if episodes_started < self.cfg.num_eval_episodes:
+                            env_time_steps[env_idx] = self.eval_envs[env_idx].reset()
+                            record_episode = (
+                                episodes_started < self.max_eval_videos
+                            ) and self.should_save_gif(self.global_frame)
+                            video_recorders[env_idx].init(
+                                self.eval_envs[env_idx], enabled=record_episode
+                            )
+                            video_enabled[env_idx] = video_recorders[env_idx].enabled
+                            episodes_started += 1
+                        else:
+                            active_envs[env_idx] = False
+                        break
 
         eval_logs = {
-            "episode_reward": total_reward / episode,
-            "episode_success": total_success / episode,
-            "episode_length": step * self.cfg.action_repeat / episode,
+            "episode_reward": total_reward / max(1, episodes_done),
+            "episode_success": total_success / max(1, episodes_done),
+            "episode_length": step * self.cfg.action_repeat / max(1, episodes_done),
             "episode": self.global_episode,
             "step": self.global_step,
         }

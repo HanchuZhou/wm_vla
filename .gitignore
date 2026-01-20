@@ -20,3 +20,5 @@ pretrained_models/
 *.sbatch
 log_mbrl
 .singularity_*
+/.tmp_bin/
+/.tmp_download_lpips.py

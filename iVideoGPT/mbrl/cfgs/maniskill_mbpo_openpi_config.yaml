@@ -31,6 +31,7 @@ use_tb: ${oc.env:USE_TB,false}
 gif_save_every_frames: 500
 max_gifs_per_type: 3
 max_eval_videos: 3
+eval_num_envs: 5
 
 repo_root: ${oc.env:REPO_PATH,/home/ucdavis/wm_vla}
 pretrained_root: ${oc.env:PRETRAINED_ROOT,${repo_root}/pretrained_models}
@@ -79,6 +80,9 @@ start_mbpo: 4000
 
 world_model:
   load_pretrained_model: true
+  rollout_do_sample: true
+  rollout_force_fp32: true
+  rollout_log_stats: true
   config_name: ${repo_root}/iVideoGPT/configs/llama/config.json
   vqgan_type: ctx_vqgan
   pretrained_model_name_or_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/tokenizer

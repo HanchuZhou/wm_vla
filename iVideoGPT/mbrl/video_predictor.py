@@ -6,6 +6,7 @@ from tqdm import tqdm
 import cv2
 
 import torch
+from transformers.generation import LogitsProcessor, LogitsProcessorList
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate.utils import set_seed
@@ -267,11 +268,34 @@ class VideoPredictor(nn.Module):
 
     @torch.no_grad()
     def rollout(self, obs, policy, horizon, do_sample=True):
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            B = obs.shape[0]
-            args = self.args
+        args = self.args
+        force_fp32 = getattr(args, "rollout_force_fp32", False)
+        log_stats = getattr(args, "rollout_log_stats", False)
+        def _log_tensor_stats(name, tensor):
+            if not log_stats:
+                return
+            finite = torch.isfinite(tensor)
+            if finite.any():
+                tmin = tensor[finite].min().item()
+                tmax = tensor[finite].max().item()
+            else:
+                tmin, tmax = float("nan"), float("nan")
+            print(
+                f"[rollout] {name} stats: "
+                f"min={tmin:.4f} max={tmax:.4f} "
+                f"nan={torch.isnan(tensor).sum().item()} "
+                f"inf={torch.isinf(tensor).sum().item()}"
+            )
 
-            obs = obs.to(self.device) / 255.
+        autocast_enabled = not force_fp32
+        with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=torch.bfloat16):
+            B = obs.shape[0]
+
+            obs = obs.to(self.device)
+            if force_fp32:
+                obs = obs.float()
+            obs = obs / 255.0
+            _log_tensor_stats("obs", obs)
             init_obs = obs
             current_frames = list(torch.chunk(obs, 3, dim=1))  # TODO: magic number (frame_stack=3)
 
@@ -291,16 +315,29 @@ class VideoPredictor(nn.Module):
             rewards = []
 
             obs = init_obs
+            _log_tensor_stats("embeds_init", embeds)
             for t in range(horizon):
                 action = policy(obs, t)
                 action_embeds = self.model.action_linear(action)
+                if force_fp32:
+                    action_embeds = action_embeds.float()
+                    embeds = embeds.float()
                 embeds[:, -1] += action_embeds
+                _log_tensor_stats("action_embeds", action_embeds)
+                _log_tensor_stats("embeds_step", embeds)
 
                 attention_mask = torch.ones(
                     embeds.shape[:2],
                     device=embeds.device,
                     dtype=torch.long,
                 )
+                model_dtype = getattr(self.model.llm, "dtype", embeds.dtype)
+                if embeds.dtype != model_dtype:
+                    if log_stats:
+                        print(
+                            f"[rollout] casting embeds from {embeds.dtype} to {model_dtype}"
+                        )
+                    embeds = embeds.to(model_dtype)
                 result = self.model.llm.generate(
                     inputs_embeds=embeds,
                     attention_mask=attention_mask,

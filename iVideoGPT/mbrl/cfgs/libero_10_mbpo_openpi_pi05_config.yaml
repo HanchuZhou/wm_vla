@@ -14,7 +14,7 @@ discount: 0.99
 num_train_frames: 1000002
 num_seed_frames: 2000
 eval_every_frames: 1000
-num_eval_episodes: 5
+num_eval_episodes: 10
 
 save_snapshot: true
 replay_buffer_size: 1000000
@@ -77,6 +77,9 @@ start_mbpo: 4000
 
 world_model:
   load_pretrained_model: true
+  rollout_do_sample: true
+  rollout_force_fp32: true
+  rollout_log_stats: true
   config_name: ${repo_root}/iVideoGPT/configs/llama/config.json
   vqgan_type: ctx_vqgan
   pretrained_model_name_or_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/tokenizer
@@ -121,7 +124,8 @@ env:
   group_size: 1
   use_fixed_reset_state_ids: true
   use_wrist_image: true
-  num_envs: 1
+  num_envs: 5
+  eval_num_envs: 5
   video_cfg:
     save_video: true
     info_on_video: true

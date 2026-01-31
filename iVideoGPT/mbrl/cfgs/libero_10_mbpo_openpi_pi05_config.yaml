@@ -22,7 +22,7 @@ replay_buffer_num_workers: 1
 nstep: 3
 batch_size: 256
 demo_path_prefix: ${repo_root}/iVideoGPT/mbrl/demonstrations
-demo: false
+demo: true
 
 seed: 1
 device: cuda

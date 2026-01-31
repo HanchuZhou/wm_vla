@@ -110,6 +110,24 @@ class VideoPredictor(nn.Module):
         self.model = self.model.to(device)
         self.tokenizer = self.tokenizer.to(device)
 
+        param_dtype = getattr(args, "train_param_dtype", None)
+        if param_dtype is None and getattr(args, "train_force_fp32", False):
+            param_dtype = "fp32"
+        if param_dtype is not None:
+            dtype_map = {
+                "fp32": torch.float32,
+                "float32": torch.float32,
+                "fp16": torch.float16,
+                "float16": torch.float16,
+                "bf16": torch.bfloat16,
+                "bfloat16": torch.bfloat16,
+            }
+            dtype = dtype_map.get(str(param_dtype).lower())
+            if dtype is None:
+                raise ValueError(f"Unsupported train_param_dtype: {param_dtype}")
+            self.model = self.model.to(dtype=dtype)
+            self.tokenizer = self.tokenizer.to(dtype=dtype)
+
         # prepare for tokenizer training
         self.lpips = LPIPS().to(device).eval()
         if args.selected_params:
@@ -125,7 +143,16 @@ class VideoPredictor(nn.Module):
             eps=1e-8,
         )
         use_grad_scaler = os.environ.get("USE_GRAD_SCALER", "0").lower() in {"1", "true", "yes", "y", "on"}
-        self.tok_scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+        def _scaler_enabled_for_params(params):
+            if not use_grad_scaler:
+                return False
+            for p in params:
+                if p.dtype != torch.float32:
+                    return False
+            return True
+        self.tok_scaler = torch.cuda.amp.GradScaler(
+            enabled=_scaler_enabled_for_params(self.tokenizer.parameters())
+        )
 
         # prepare for model training
         no_decay = []
@@ -149,7 +176,9 @@ class VideoPredictor(nn.Module):
             },
         ]
         self.model_optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.model_lr)
-        self.model_scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+        self.model_scaler = torch.cuda.amp.GradScaler(
+            enabled=_scaler_enabled_for_params(self.model.parameters())
+        )
 
     def train(self, batch, update_tokenizer=True, update_model=True):
         start = time.time()
@@ -169,7 +198,8 @@ class VideoPredictor(nn.Module):
         return metrics
 
     def update_tokenizer(self, args, obs):
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        autocast_enabled = not getattr(args, "train_force_fp32", False)
+        with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=torch.bfloat16):
             self.tok_optimizer.zero_grad()
             with torch.no_grad():
                 B, T, C, H, W = obs.shape
@@ -227,7 +257,8 @@ class VideoPredictor(nn.Module):
         }
 
     def update_model(self, args, obs, action, reward):
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        autocast_enabled = not getattr(args, "train_force_fp32", False)
+        with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=torch.bfloat16):
             self.model_optimizer.zero_grad()
             pixel_values, actions, rewards = obs.to(self.device), action.to(self.device), reward.to(self.device)
 
@@ -295,7 +326,6 @@ class VideoPredictor(nn.Module):
             if force_fp32:
                 obs = obs.float()
             obs = obs / 255.0
-            _log_tensor_stats("obs", obs)
             init_obs = obs
             current_frames = list(torch.chunk(obs, 3, dim=1))  # TODO: magic number (frame_stack=3)
 
@@ -315,7 +345,6 @@ class VideoPredictor(nn.Module):
             rewards = []
 
             obs = init_obs
-            _log_tensor_stats("embeds_init", embeds)
             for t in range(horizon):
                 action = policy(obs, t)
                 action_embeds = self.model.action_linear(action)
@@ -323,8 +352,6 @@ class VideoPredictor(nn.Module):
                     action_embeds = action_embeds.float()
                     embeds = embeds.float()
                 embeds[:, -1] += action_embeds
-                _log_tensor_stats("action_embeds", action_embeds)
-                _log_tensor_stats("embeds_step", embeds)
 
                 attention_mask = torch.ones(
                     embeds.shape[:2],

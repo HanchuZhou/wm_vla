@@ -106,10 +106,14 @@ class ReplayBuffer(IterableDataset):
             files = glob.glob(os.path.join(demo_path, '*.npz'))
             if len(files) == 0:
                 assert False
+            print(f"[stage] demo preload start: {demo_path} ({len(files)} files)")
+            loaded = 0
             for display in files:
                 display = Path(display)
                 if not self._store_episode(display):
                     assert False
+                loaded += 1
+            print(f"[stage] demo preload end: loaded {loaded} episodes")
 
     def _sample_episode(self):
         eps_fn = random.choice(self._episode_fns)

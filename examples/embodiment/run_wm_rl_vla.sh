@@ -8,23 +8,10 @@ export PRETRAINED_ROOT="${REPO_PATH}/pretrained_models"
 
 MBPO_TASK_NAME="${MBPO_TASK_NAME:-libero_10}"
 MBPO_FRAMES="${MBPO_FRAMES:-1000002}"
-MBPO_DEMO="${MBPO_DEMO:-false}"
+MBPO_DEMO="${MBPO_DEMO:-true}"
 MBPO_GPU="${MBPO_GPU:-0}"
 MBPO_CONFIG="${MBPO_CONFIG:-libero_10_mbpo_openpi_pi05_config}"
 MBPO_EXTRA_ARGS_STR="${MBPO_EXTRA_ARGS:-}"
-
-VLA_CONFIG="${VLA_CONFIG:-libero_10_grpo_openpi_pi05}"
-VLA_GPUS="${VLA_GPUS:-0,1,2}"
-RAY_NUM_GPUS="${RAY_NUM_GPUS:-}"
-RAY_NUM_CPUS="${RAY_NUM_CPUS:-16}"
-RAY_OBJ_STORE_BYTES="${RAY_OBJ_STORE_BYTES:-2147483648}"
-START_RAY="${START_RAY:-1}"
-VLA_EXTRA_ARGS_STR="${VLA_EXTRA_ARGS:-}"
-
-if [[ -z "${RAY_NUM_GPUS}" ]]; then
-  IFS=',' read -r -a _vla_gpu_list <<< "${VLA_GPUS}"
-  RAY_NUM_GPUS="${#_vla_gpu_list[@]}"
-fi
 
 export MS_SKIP_ASSET_DOWNLOAD_PROMPT=1
 unset LD_PRELOAD
@@ -93,39 +80,4 @@ if [[ "${SKIP_MBRL:-0}" != "1" ]]; then
     demo="${MBPO_DEMO}" \
     demo_path_prefix="${REPO_PATH}/iVideoGPT/mbrl/demonstrations" \
     "${MBPO_EXTRA_ARGS[@]}"
-fi
-
-if [[ "${SKIP_VLA:-0}" != "1" ]]; then
-  echo "[vla] config=${VLA_CONFIG} gpus=${VLA_GPUS} ray_gpus=${RAY_NUM_GPUS}"
-  if command -v switch_env >/dev/null 2>&1; then
-    source switch_env openpi
-  fi
-
-  export CUDA_VISIBLE_DEVICES="${VLA_GPUS}"
-  if [[ -z "${RAY_TMPDIR:-}" ]]; then
-    export RAY_TMPDIR="${SCRATCH:-/tmp}/ray_tmp_${USER}_$(date +%s)"
-  fi
-  if [[ -z "${RAY_STORAGE:-}" ]]; then
-    export RAY_STORAGE="${SCRATCH:-/tmp}/ray_storage_${USER}_$(date +%s)"
-  fi
-  mkdir -p "${RAY_TMPDIR}" "${RAY_STORAGE}"
-
-  if [[ "${START_RAY}" == "1" ]]; then
-    ray stop --force >/dev/null 2>&1 || true
-    ray start --head \
-      --dashboard-port=0 \
-      --object-store-memory="${RAY_OBJ_STORE_BYTES}" \
-      --temp-dir "${RAY_TMPDIR}" \
-      --storage "${RAY_STORAGE}" \
-      --num-gpus="${RAY_NUM_GPUS}" \
-      --num-cpus="${RAY_NUM_CPUS}"
-  fi
-
-  export RAY_ADDRESS=auto
-  if [[ -z "${WANDB_API_KEY:-}" ]]; then
-    echo "WANDB_API_KEY not set; wandb logging may be disabled." >&2
-  fi
-
-  EMBODIMENT_EXTRA_ARGS="${VLA_EXTRA_ARGS_STR}" \
-    bash "${REPO_PATH}/examples/embodiment/run_embodiment.sh" "${VLA_CONFIG}"
 fi

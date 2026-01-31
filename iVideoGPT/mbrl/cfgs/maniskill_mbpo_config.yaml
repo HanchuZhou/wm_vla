@@ -132,11 +132,3 @@ hydra:
   sweep:
     dir: ./exp/${now:%Y.%m.%d}/${now:%H%M}_${exp_name}_${task_name}
     subdir: ${hydra.job.num}
-  launcher:
-    timeout_min: 4300
-    cpus_per_task: 10
-    gpus_per_node: 1
-    tasks_per_node: 1
-    mem_gb: 160
-    nodes: 1
-    submitit_folder: ./exp/${now:%Y.%m.%d}/${now:%H%M%S}_${agent_cfg.experiment}/.slurm

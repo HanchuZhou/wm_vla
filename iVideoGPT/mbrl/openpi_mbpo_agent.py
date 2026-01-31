@@ -29,6 +29,7 @@ class OpenPiMBPOAgent:
     ):
         self.device = torch.device(device)
         self.action_dim = action_shape[0]
+        self.state_dim = self.action_dim
         self.batch_size = batch_size
         self.update_epochs = update_epochs
         self.clip_ratio = clip_ratio
@@ -78,6 +79,9 @@ class OpenPiMBPOAgent:
         task_descriptions: Optional[list[str]] = None,
     ) -> Dict[str, Any]:
         if isinstance(obs, dict):
+            states = obs.get("states")
+            if torch.is_tensor(states) and states.ndim > 0:
+                self.state_dim = int(states.shape[-1])
             return obs
         if torch.is_tensor(obs):
             tensor_obs = obs
@@ -91,7 +95,7 @@ class OpenPiMBPOAgent:
             if image.max() <= 1.0:
                 image = image * 255.0
         image = image.to(torch.uint8)
-        state = torch.zeros((image.shape[0], self.action_dim), dtype=torch.float32)
+        state = torch.zeros((image.shape[0], self.state_dim), dtype=torch.float32)
         if task_descriptions is None:
             task_descriptions = [""] * image.shape[0]
         elif len(task_descriptions) == 1 and image.shape[0] > 1:

@@ -61,3 +61,33 @@ python datasets/preprocess_vp2.py --dir_path robosuite --save_path robosuite_pre
 ```
 
 Then modify the saved paths (e.g. `robodesk_preprocessed` and `robosuite_preprocessed`) in `DATASET.yaml`.
+
+## LIBERO Demo Prepare for WM-VLA
+
+Download the official LIBERO demo zip and extract it:
+
+```bash
+mkdir -p iVideoGPT/datasets/libero_raw
+wget -O iVideoGPT/datasets/libero_raw/libero_spatial.zip \
+  https://utexas.box.com/shared/static/04k94hyizn4huhbv5sz4ev9p2h1p6s7f.zip
+unzip -o iVideoGPT/datasets/libero_raw/libero_spatial.zip -d iVideoGPT/datasets/libero_raw
+```
+
+Convert the hdf5 demos into MBPO `.npz` episodes:
+
+```bash
+python iVideoGPT/datasets/convert_libero_demos.py \
+  --download-dir iVideoGPT/datasets/libero_raw \
+  --output-dir iVideoGPT/mbrl/demonstrations \
+  --suites libero_spatial
+```
+
+If validation GIFs look upside down with demos enabled, re-run conversion with:
+
+```bash
+python iVideoGPT/datasets/convert_libero_demos.py \
+  --download-dir iVideoGPT/datasets/libero_raw \
+  --output-dir iVideoGPT/mbrl/demonstrations \
+  --suites libero_spatial \
+  --flip-vertical
+```

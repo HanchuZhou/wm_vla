@@ -172,6 +172,10 @@ class Workspace:
 
         # for agent training
         demo_path = os.path.join(self.cfg.demo_path_prefix, self.cfg.task_name) if self.cfg.demo else None
+        if demo_path is not None:
+            self._has_demo = len(list(Path(demo_path).glob("*.npz"))) > 0
+        else:
+            self._has_demo = False
         self.replay_loader = make_replay_loader(
             self.work_dir / 'buffer', self.cfg.replay_buffer_size,
             int(self.cfg.batch_size * self.cfg.real_ratio), self.cfg.replay_buffer_num_workers,
@@ -448,8 +452,8 @@ class Workspace:
         }
 
     def validate(self, global_frame):
-        if self.replay_storage._num_episodes == 0:
-            print("[stage] validate skipped (empty replay buffer)")
+        if self.replay_storage._num_episodes == 0 and not self._has_demo:
+            print("[stage] validate skipped (empty replay buffer and no demos)")
             return {}
         if self._seg_replay_iter is None:
             self._seg_replay_iter = iter(self.seg_replay_loader)
@@ -585,32 +589,37 @@ class Workspace:
             # try to update the agent
             if not seed_until_step(self.global_step):
                 if not init_model:
-                    print("[stage] init world model update")
+                    if self.cfg.demo:
+                        print("[stage] demo fine-tuning start")
+                    print("[stage] seed world model update start")
                     # init train the model
                     for _ in trange(self.cfg.init_update_gen_steps):
-                        if self.replay_storage._num_episodes == 0:
-                            print("[stage] init world model update skipped (empty replay buffer)")
+                        if self.replay_storage._num_episodes == 0 and not self._has_demo:
+                            print("[stage] seed world model update skipped (empty replay buffer and no demos)")
                             break
                         if self._seg_replay_iter is None:
                             self._seg_replay_iter = iter(self.seg_replay_loader)
                         batch = next(self._seg_replay_iter)
-                        metrics = self.video_predictor.train(batch)
+                        update_tokenizer = getattr(self.cfg.world_model, "seed_update_tokenizer", True)
+                        metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
                         if _ % 10 == 0:
                             metrics = {k + "_init": v for k, v in metrics.items()}
                             self.logger.log_metrics(metrics, _, ty='train')
+                    print("[stage] seed world model update end")
                     self.video_predictor.save_snapshot(self.work_dir, suffix='_init')
                     
                     metrics = self.validate(self.global_frame)
                     self.logger.log_metrics(metrics, self.global_frame, ty='eval')
 
                     init_model = True
+                    if self.cfg.demo:
+                        print("[stage] demo fine-tuning end")
                 else:
-                    if update_gen_every_step(self.global_step):
-                        print("[stage] update world model")
                     # update the model
                     if update_gen_every_step(self.global_step):
-                        if self.replay_storage._num_episodes == 0:
-                            print("[stage] update world model skipped (empty replay buffer)")
+                        print("[stage] update world model")
+                        if self.replay_storage._num_episodes == 0 and not self._has_demo:
+                            print("[stage] update world model skipped (empty replay buffer and no demos)")
                             break
                         for _ in range(self.cfg.update_gen_times):
                             if self._seg_replay_iter is None:
@@ -629,7 +638,8 @@ class Workspace:
                 for _ in range(self.cfg.agent_update_times):
                     metrics = self.agent.update(self.global_step)
                 self.logger.log_metrics(metrics, self.global_frame, ty='train')
-                
+                print("[stage] policy updated")
+
                 # generate fake transitions
                 if self.global_step * self.cfg.action_repeat >= self.cfg.start_mbpo and gen_every_step(self.global_step):
                     print("[stage] imagined rollouts")

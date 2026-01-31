@@ -22,7 +22,7 @@ replay_buffer_num_workers: 1
 nstep: 3
 batch_size: 256
 demo_path_prefix: ${repo_root}/iVideoGPT/mbrl/demonstrations
-demo: false
+demo: true
 
 seed: 1
 device: cuda
@@ -67,7 +67,7 @@ agent:
 gen_every_steps: 200
 gen_batch: 32
 gen_horizon: 10
-update_gen_every_step: 10
+update_gen_every_step: 100
 update_tokenizer_every_step: 40
 update_gen_times: 1
 init_update_gen_steps: 1000
@@ -77,6 +77,7 @@ start_mbpo: 4000
 
 world_model:
   load_pretrained_model: true
+  train_param_dtype: fp32
   rollout_do_sample: true
   rollout_force_fp32: true
   rollout_log_stats: true

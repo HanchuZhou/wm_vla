@@ -108,6 +108,45 @@ Run the MBPO + iVideoGPT pipeline on ManiSkill tasks from the repository root:
 
 Logs and checkpoints are written to `log_mbrl/<date>/maniskill_mbpo_<task>_*` with the current Hydra configuration.
 
+## 🧠 Run WM-RL with LIBERO
+
+Prepare LIBERO demonstrations and enable MBPO demo seeding:
+
+1. **Download LIBERO demos** (official release):
+   ```bash
+   mkdir -p iVideoGPT/datasets/libero_raw
+   wget -O iVideoGPT/datasets/libero_raw/libero_spatial.zip \
+     https://utexas.box.com/shared/static/04k94hyizn4huhbv5sz4ev9p2h1p6s7f.zip
+   unzip -o iVideoGPT/datasets/libero_raw/libero_spatial.zip -d iVideoGPT/datasets/libero_raw
+   ```
+2. **Convert to MBPO `.npz` demos** (stored under `iVideoGPT/mbrl/demonstrations/<suite>`):
+   ```bash
+   python iVideoGPT/datasets/convert_libero_demos.py \
+       --download-dir iVideoGPT/datasets/libero_raw \
+       --output-dir iVideoGPT/mbrl/demonstrations \
+       --suites libero_spatial
+   ```
+   If validation GIFs look upside down with demos enabled, re-run conversion with `--flip-vertical`:
+   ```bash
+   python iVideoGPT/datasets/convert_libero_demos.py \
+       --download-dir iVideoGPT/datasets/libero_raw \
+       --output-dir iVideoGPT/mbrl/demonstrations \
+       --suites libero_spatial \
+       --flip-vertical
+   ```
+3. **Launch LIBERO MBPO** (demo seeding enabled by default in configs):
+   ```bash
+   CUDA_VISIBLE_DEVICES=0 python iVideoGPT/mbrl/train_libero_mbpo_openpi.py \
+       --config-name libero_spatial_mbpo_openpi_pi05_config \
+       task_name=libero_spatial demo=true
+   ```
+
+For the full WM-RL + VLA pipeline inside the container, run:
+```bash
+MBPO_TASK_NAME=libero_spatial MBPO_CONFIG=libero_spatial_mbpo_openpi_pi05_config \
+  bash examples/embodiment/run_wm_rl_vla_libero_spatial_mbpo_openpi_pi05.sh
+```
+
 ## 🚀 Inference Examples
 
 For action-free video prediction on Open X-Embodiment, run:

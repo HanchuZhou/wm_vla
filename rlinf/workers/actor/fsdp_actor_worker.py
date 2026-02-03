@@ -733,6 +733,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         return rollout_metrics
 
+    def append_rollout_batch(self, extra_batch: dict[str, torch.Tensor]):
+        if extra_batch is None:
+            return
+        if not hasattr(self, "rollout_batch") or self.rollout_batch is None:
+            self.rollout_batch = extra_batch
+            return
+
+        for key, value in extra_batch.items():
+            if value is None:
+                continue
+            if key not in self.rollout_batch or self.rollout_batch[key] is None:
+                self.rollout_batch[key] = value
+            else:
+                self.rollout_batch[key] = torch.cat(
+                    [self.rollout_batch[key], value], dim=1
+                )
+
+        if (
+            not self.cfg.env.train.auto_reset
+            and not self.cfg.env.train.ignore_terminations
+        ):
+            dones = self.rollout_batch["dones"]
+            loss_mask, loss_mask_sum = compute_loss_mask(dones)
+            if self.cfg.algorithm.reward_type == "chunk_level":
+                loss_mask = loss_mask.any(dim=-1, keepdim=True)
+                loss_mask_sum = loss_mask_sum[..., -1:]
+            self.rollout_batch["loss_mask"] = loss_mask
+            self.rollout_batch["loss_mask_sum"] = loss_mask_sum
+
     def run_training(self):
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)

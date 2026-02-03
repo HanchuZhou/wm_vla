@@ -1,0 +1,400 @@
+import math
+import os
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+import cv2
+import numpy as np
+import torch
+from dm_env import StepType, specs
+
+from iVideoGPT.mbrl.replay_buffer import (
+    ReplayBufferStorage,
+    make_replay_loader,
+    make_segment_replay_loader,
+)
+from iVideoGPT.mbrl.video_predictor import VideoPredictor
+from rlinf.data.io_struct import EmbodiedRolloutResult
+from rlinf.models import get_model
+
+
+@dataclass
+class _SimpleTimeStep:
+    step_type: Any
+    reward: Any
+    discount: Any
+    observation: Any
+    action: Any
+
+    def last(self) -> bool:
+        return self.step_type == StepType.LAST
+
+    def __getitem__(self, attr):
+        if isinstance(attr, str):
+            return getattr(self, attr)
+        return tuple.__getitem__(self, attr)
+
+
+class WorldModelMBPO:
+    def __init__(
+        self,
+        cfg,
+        work_dir: str | os.PathLike,
+        env_world_size: int,
+        stage_num: int,
+        num_envs_per_stage: int,
+        device: str = "cuda:0",
+    ) -> None:
+        self.cfg = cfg
+        self.device = device
+        self.work_dir = Path(work_dir)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+
+        self.frame_stack = int(getattr(cfg, "frame_stack", 3))
+        self.image_size = int(getattr(cfg, "image_size", 64))
+        self.action_dim = int(cfg.actor.model.action_dim)
+        self.num_action_chunks = int(cfg.actor.model.num_action_chunks)
+
+        self.env_world_size = env_world_size
+        self.stage_num = stage_num
+        self.num_envs_per_stage = num_envs_per_stage
+        self.total_envs = env_world_size * stage_num * num_envs_per_stage
+
+        self._frame_buffers: list[deque] = [
+            deque(maxlen=self.frame_stack) for _ in range(self.total_envs)
+        ]
+        self._env_done = [True for _ in range(self.total_envs)]
+        self._task_desc_per_env = [""] * self.total_envs
+
+        self.total_env_steps = 0
+        self.init_model = False
+        self.init_gen = False
+
+        self._setup_replay_buffers()
+        self._setup_world_model()
+        self._setup_policy_model()
+
+    def _setup_replay_buffers(self) -> None:
+        obs_spec = specs.BoundedArray(
+            shape=(self.frame_stack * 3, self.image_size, self.image_size),
+            dtype=np.uint8,
+            minimum=0,
+            maximum=255,
+            name="observation",
+        )
+        action_spec = specs.BoundedArray(
+            shape=(self.action_dim,),
+            dtype=np.float32,
+            minimum=-1.0,
+            maximum=1.0,
+            name="action",
+        )
+        reward_spec = specs.Array((1,), np.float32, "reward")
+        discount_spec = specs.Array((1,), np.float32, "discount")
+        data_specs = (obs_spec, action_spec, reward_spec, discount_spec)
+
+        buffer_dir = self.work_dir / "buffer"
+        buffer_dir.mkdir(parents=True, exist_ok=True)
+        self.replay_storage = ReplayBufferStorage(data_specs, buffer_dir)
+
+        demo_path = None
+        if getattr(self.cfg, "demo", False):
+            demo_path = os.path.join(self.cfg.demo_path_prefix, self.cfg.task_name)
+        if demo_path is not None:
+            self._has_demo = len(list(Path(demo_path).glob("*.npz"))) > 0
+        else:
+            self._has_demo = False
+
+        self.replay_loader = make_replay_loader(
+            buffer_dir,
+            self.cfg.replay_buffer_size,
+            int(self.cfg.batch_size * self.cfg.real_ratio),
+            self.cfg.replay_buffer_num_workers,
+            self.cfg.save_snapshot,
+            self.cfg.nstep,
+            self.cfg.discount,
+            demo_path,
+        )
+        self._replay_iter = None
+
+        self.seg_replay_loader = make_segment_replay_loader(
+            buffer_dir,
+            self.cfg.replay_buffer_size,
+            self.cfg.world_model.batch_size,
+            self.cfg.replay_buffer_num_workers,
+            self.cfg.save_snapshot,
+            self.cfg.nstep,
+            self.cfg.discount,
+            self.cfg.gen_horizon + self.cfg.world_model.context_length,
+            demo_path,
+        )
+        self._seg_replay_iter = None
+
+    def _setup_world_model(self) -> None:
+        self.video_predictor = VideoPredictor(self.device, self.cfg.world_model)
+
+    def _setup_policy_model(self) -> None:
+        self.policy_model = get_model(
+            self.cfg.actor.checkpoint_load_path,
+            self.cfg.actor.model,
+        )
+        self.policy_model.eval()
+        self.policy_model.to(self.device)
+
+    def load_policy_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.policy_model.load_state_dict(state_dict)
+        self.policy_model.eval()
+
+    def _global_env_index(self, env_rank: int, stage_id: int, env_idx: int) -> int:
+        return (
+            (env_rank * self.stage_num + stage_id) * self.num_envs_per_stage + env_idx
+        )
+
+    def _resize_frame(self, frame: np.ndarray) -> np.ndarray:
+        if frame.shape[0] != self.image_size or frame.shape[1] != self.image_size:
+            frame = cv2.resize(
+                frame,
+                (self.image_size, self.image_size),
+                interpolation=cv2.INTER_AREA,
+            )
+        return frame
+
+    def _to_chw_uint8(self, frame: Any) -> np.ndarray:
+        if torch.is_tensor(frame):
+            frame = frame.detach().cpu().numpy()
+        frame = np.asarray(frame)
+        if frame.ndim == 3 and frame.shape[0] in {1, 3} and frame.shape[-1] not in {1, 3}:
+            frame = frame.transpose(1, 2, 0)
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
+        frame = self._resize_frame(frame)
+        if frame.ndim != 3 or frame.shape[-1] not in {1, 3}:
+            raise ValueError(f"Unexpected frame shape: {frame.shape}")
+        if frame.shape[-1] == 1:
+            frame = np.repeat(frame, 3, axis=-1)
+        return frame.transpose(2, 0, 1)
+
+    def _ensure_frame_stack(self, env_id: int, frame: np.ndarray) -> None:
+        if not self._frame_buffers[env_id] or self._env_done[env_id]:
+            self._frame_buffers[env_id].clear()
+            for _ in range(self.frame_stack):
+                self._frame_buffers[env_id].append(frame)
+            self._env_done[env_id] = False
+        else:
+            self._frame_buffers[env_id].append(frame)
+
+    def _stack_frames(self, env_id: int) -> np.ndarray:
+        frames = list(self._frame_buffers[env_id])
+        if len(frames) != self.frame_stack:
+            raise RuntimeError("Frame stack not initialized")
+        return np.concatenate(frames, axis=0)
+
+    def ingest_reset(self, payload: dict[str, Any]) -> None:
+        env_rank = int(payload["env_rank"])
+        stage_id = int(payload["stage_id"])
+        images = payload.get("images")
+        task_descs = payload.get("task_descriptions")
+        if task_descs is not None:
+            for env_idx, desc in enumerate(task_descs):
+                global_idx = self._global_env_index(env_rank, stage_id, env_idx)
+                self._task_desc_per_env[global_idx] = desc
+        if images is None:
+            return
+        if torch.is_tensor(images):
+            images = images.detach().cpu().numpy()
+        for env_idx, frame in enumerate(images):
+            global_idx = self._global_env_index(env_rank, stage_id, env_idx)
+            frame_chw = self._to_chw_uint8(frame)
+            self._frame_buffers[global_idx].clear()
+            for _ in range(self.frame_stack):
+                self._frame_buffers[global_idx].append(frame_chw)
+            self._env_done[global_idx] = False
+
+    def ingest_step(self, payload: dict[str, Any]) -> int:
+        env_rank = int(payload["env_rank"])
+        stage_id = int(payload["stage_id"])
+        images = payload["images"]
+        actions = payload["actions"]
+        rewards = payload["rewards"]
+        dones = payload["dones"]
+        task_descs = payload.get("task_descriptions")
+
+        if torch.is_tensor(images):
+            images = images.detach().cpu().numpy()
+        if torch.is_tensor(actions):
+            actions = actions.detach().cpu().numpy()
+        if torch.is_tensor(rewards):
+            rewards = rewards.detach().cpu().numpy()
+        if torch.is_tensor(dones):
+            dones = dones.detach().cpu().numpy()
+
+        if task_descs is not None:
+            for env_idx, desc in enumerate(task_descs):
+                global_idx = self._global_env_index(env_rank, stage_id, env_idx)
+                self._task_desc_per_env[global_idx] = desc
+
+        num_envs, chunk_steps = images.shape[:2]
+        transition_count = 0
+        for env_idx in range(num_envs):
+            global_idx = self._global_env_index(env_rank, stage_id, env_idx)
+            for step_idx in range(chunk_steps):
+                frame = images[env_idx, step_idx]
+                frame_chw = self._to_chw_uint8(frame)
+                self._ensure_frame_stack(global_idx, frame_chw)
+                stacked = self._stack_frames(global_idx)
+
+                action = actions[env_idx, step_idx].astype(np.float32)
+                reward = np.array([rewards[env_idx, step_idx]], dtype=np.float32)
+                done_flag = bool(dones[env_idx, step_idx])
+                discount = np.array([0.0 if done_flag else 1.0], dtype=np.float32)
+                step_type = StepType.LAST if done_flag else StepType.MID
+
+                time_step = _SimpleTimeStep(
+                    step_type=step_type,
+                    reward=reward,
+                    discount=discount,
+                    observation=stacked,
+                    action=action,
+                )
+                self.replay_storage.add(time_step)
+                transition_count += 1
+
+                if done_flag:
+                    self._env_done[global_idx] = True
+                    self._frame_buffers[global_idx].clear()
+        self.total_env_steps += transition_count
+        return transition_count
+
+    def _get_replay_iter(self):
+        if self._replay_iter is None:
+            self._replay_iter = iter(self.replay_loader)
+        return self._replay_iter
+
+    def _get_seg_replay_iter(self):
+        if self._seg_replay_iter is None:
+            self._seg_replay_iter = iter(self.seg_replay_loader)
+        return self._seg_replay_iter
+
+    def _sample_task_descriptions(self, batch_size: int) -> list[str]:
+        pool = [d for d in self._task_desc_per_env if d]
+        if not pool:
+            return [""] * batch_size
+        if len(pool) >= batch_size:
+            return pool[:batch_size]
+        repeats = math.ceil(batch_size / len(pool))
+        return (pool * repeats)[:batch_size]
+
+    def _prepare_env_obs(self, obs: torch.Tensor, task_descriptions: list[str]):
+        if obs.ndim == 3:
+            obs = obs.unsqueeze(0)
+        image = obs[:, -3:, :, :]
+        if torch.is_floating_point(image):
+            if image.max() <= 1.0:
+                image = image * 255.0
+        image = image.to(torch.uint8)
+        batch = image.shape[0]
+        states = torch.zeros((batch, self.action_dim), dtype=torch.float32)
+        if len(task_descriptions) == 1 and batch > 1:
+            task_descriptions = task_descriptions * batch
+        elif len(task_descriptions) != batch:
+            task_descriptions = (task_descriptions * math.ceil(batch / len(task_descriptions)))[:batch]
+        env_obs = {
+            "images": image.cpu(),
+            "states": states,
+            "task_descriptions": task_descriptions,
+        }
+        if getattr(self.cfg.actor.model, "use_wrist_image", False):
+            env_obs["wrist_images"] = image.cpu()
+        return env_obs
+
+    def _policy_predict(self, obs: torch.Tensor, task_descs: list[str]):
+        env_obs = self._prepare_env_obs(obs, task_descs)
+        with torch.no_grad():
+            actions, result = self.policy_model.predict_action_batch(
+                env_obs=env_obs,
+                mode="train",
+            )
+        return actions, result
+
+    def maybe_update_world_model(self, env_steps: int) -> dict[str, float]:
+        metrics = {}
+        if env_steps < self.cfg.num_seed_frames:
+            return metrics
+
+        if not self.init_model:
+            if self.replay_storage._num_episodes == 0 and not self._has_demo:
+                return metrics
+            for idx in range(self.cfg.init_update_gen_steps):
+                batch = next(self._get_seg_replay_iter())
+                update_tokenizer = getattr(
+                    self.cfg.world_model, "seed_update_tokenizer", True
+                )
+                metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
+            self.video_predictor.save_snapshot(self.work_dir, suffix="_init")
+            self.init_model = True
+            return {f"wm_init/{k}": v for k, v in metrics.items()}
+
+        if self.cfg.update_gen_every_step > 0 and env_steps % self.cfg.update_gen_every_step == 0:
+            if self.replay_storage._num_episodes == 0 and not self._has_demo:
+                return metrics
+            for _ in range(self.cfg.update_gen_times):
+                batch = next(self._get_seg_replay_iter())
+                update_tokenizer = (
+                    env_steps
+                    % max(1, (self.cfg.update_tokenizer_every_step // max(1, self.cfg.action_repeat)))
+                    == 0
+                )
+                metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
+            return {f"wm/{k}": v for k, v in metrics.items()}
+
+        return metrics
+
+    def generate_imagined_rollout(self, chunk_steps: int) -> Optional[dict[str, torch.Tensor]]:
+        if self.replay_storage._num_episodes == 0 and not self._has_demo:
+            return None
+        batch = next(self._get_replay_iter())
+        obs = batch[0][: self.cfg.gen_batch]
+        obs = torch.as_tensor(obs, device=self.device)
+        horizon = chunk_steps * self.num_action_chunks
+        rollout_result = EmbodiedRolloutResult()
+        actions_cache: Optional[torch.Tensor] = None
+        cache_index = 0
+        task_descs = self._sample_task_descriptions(obs.shape[0])
+
+        def policy(step_obs: torch.Tensor, step_idx: int):
+            nonlocal actions_cache, cache_index
+            if step_idx % self.num_action_chunks == 0:
+                actions, result = self._policy_predict(step_obs, task_descs)
+                actions_cache = torch.as_tensor(
+                    actions, device=self.device, dtype=torch.float32
+                )
+                cache_index = 0
+                rollout_result.append_result(result)
+            action = actions_cache[:, cache_index]
+            cache_index += 1
+            return action
+
+        obss, _actions, rewards = self.video_predictor.rollout(
+            obs,
+            policy,
+            horizon,
+            do_sample=getattr(self.cfg.world_model, "rollout_do_sample", True),
+        )
+        rewards = rewards[:, 1:]
+        if rewards.ndim == 2:
+            rewards = rewards.unsqueeze(-1)
+        rewards = rewards.reshape(
+            rewards.shape[0], chunk_steps, self.num_action_chunks, -1
+        )
+        rewards = rewards.squeeze(-1).transpose(0, 1).contiguous()
+        dones = torch.zeros_like(rewards, dtype=torch.bool)
+
+        rollout_batch = rollout_result.to_dict()
+        rollout_batch["rewards"] = rewards.cpu().contiguous()
+        rollout_batch["dones"] = dones.cpu().contiguous()
+        return rollout_batch
+
+    def should_start_mbpo(self, env_steps: int) -> bool:
+        return env_steps >= self.cfg.start_mbpo

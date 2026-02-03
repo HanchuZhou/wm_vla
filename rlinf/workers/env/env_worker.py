@@ -46,6 +46,16 @@ class EnvWorker(Worker):
         self._action_queue_name = cfg.rollout.channel.queue_name
         self._replay_buffer_name = cfg.actor.channel.queue_name
 
+        self._wm_enabled = bool(
+            getattr(cfg, "world_model", None)
+            and cfg.world_model.get("enable", False)
+        )
+        self._wm_channel = None
+        self._wm_queue_name = None
+        if self._wm_enabled:
+            self._wm_queue_name = cfg.world_model.channel.queue_name
+            self._wm_channel = self.connect_channel(cfg.world_model.channel.name)
+
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
         assert (
             self._component_placement.get_world_size("rollout")
@@ -256,9 +266,26 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
-            self.simulator_list[stage_id].chunk_step(chunk_actions)
-        )
+        if self._wm_enabled and self.cfg.env.train.simulator_type != "libero":
+            raise RuntimeError(
+                "World model integration currently supports libero only."
+            )
+
+        if self._wm_enabled:
+            (
+                extracted_obs,
+                chunk_rewards,
+                chunk_terminations,
+                chunk_truncations,
+                infos,
+                chunk_obs,
+            ) = self.simulator_list[stage_id].chunk_step(
+                chunk_actions, return_obs=True
+            )
+        else:
+            extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
+                self.simulator_list[stage_id].chunk_step(chunk_actions)
+            )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
@@ -286,6 +313,18 @@ class EnvWorker(Worker):
             rewards=chunk_rewards,
             dones=chunk_dones,
         )
+        if self._wm_enabled and self._wm_channel is not None:
+            payload = {
+                "type": "step",
+                "env_rank": self._rank,
+                "stage_id": stage_id,
+                "images": chunk_obs,
+                "actions": torch.as_tensor(chunk_actions).cpu(),
+                "rewards": chunk_rewards.cpu(),
+                "dones": chunk_dones.cpu(),
+                "task_descriptions": extracted_obs.get("task_descriptions", None),
+            }
+            self._wm_channel.put(item=payload, key=self._wm_queue_name)
         return env_output, env_info
 
     def env_evaluate_step(
@@ -397,6 +436,19 @@ class EnvWorker(Worker):
             if not self.cfg.env.train.auto_reset:
                 for i in range(self.stage_num):
                     extracted_obs, infos = self.simulator_list[i].reset()
+                    if self._wm_enabled and self._wm_channel is not None:
+                        reset_payload = {
+                            "type": "reset",
+                            "env_rank": self._rank,
+                            "stage_id": i,
+                            "images": extracted_obs["images_and_states"]["full_image"],
+                            "task_descriptions": extracted_obs.get(
+                                "task_descriptions", None
+                            ),
+                        }
+                        self._wm_channel.put(
+                            item=reset_payload, key=self._wm_queue_name
+                        )
                     self.last_obs_list.append(extracted_obs)
                     dones = (
                         torch.zeros((self.cfg.env.train.num_envs,), dtype=bool)
@@ -423,6 +475,21 @@ class EnvWorker(Worker):
                         rewards=None,
                         dones=self.last_dones_list[i],
                     )
+                    if self._wm_enabled and self._wm_channel is not None:
+                        reset_payload = {
+                            "type": "reset",
+                            "env_rank": self._rank,
+                            "stage_id": i,
+                            "images": self.last_obs_list[i][
+                                "images_and_states"
+                            ]["full_image"],
+                            "task_descriptions": self.last_obs_list[i].get(
+                                "task_descriptions", None
+                            ),
+                        }
+                        self._wm_channel.put(
+                            item=reset_payload, key=self._wm_queue_name
+                        )
                     env_output_list.append(env_output)
 
             for stage_id in range(self.stage_num):

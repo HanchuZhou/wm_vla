@@ -382,11 +382,12 @@ class LiberoEnv(gym.Env):
             infos,
         )
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, return_obs: bool = False):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
 
         chunk_rewards = []
+        chunk_obs = [] if return_obs else None
 
         raw_chunk_terminations = []
         raw_chunk_truncations = []
@@ -399,6 +400,8 @@ class LiberoEnv(gym.Env):
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+            if return_obs:
+                chunk_obs.append(extracted_obs["images_and_states"]["full_image"])
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
@@ -426,6 +429,16 @@ class LiberoEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+        if return_obs:
+            chunk_obs = torch.stack(chunk_obs, dim=1)  # [num_envs, chunk_steps, H, W, C]
+            return (
+                extracted_obs,
+                chunk_rewards,
+                chunk_terminations,
+                chunk_truncations,
+                infos,
+                chunk_obs,
+            )
         return (
             extracted_obs,
             chunk_rewards,

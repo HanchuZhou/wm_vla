@@ -25,3 +25,4 @@ log_mbrl
 *.hdf5
 *.zip
 *.cache
+*.npz

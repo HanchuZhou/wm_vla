@@ -28,25 +28,42 @@ RLinf is a flexible and scalable open-source infrastructure designed for post-tr
   <img src="docs/source-en/_static/svg/overview.svg" alt="RLinf-overview"/>
 </div>
 
-## Singularity quickstart (wm_rl_vla)
+## WM_VLA !!!!
 
-To reproduce the MBPO+VLA run used here:
-1. Initialize: 
-```bash
-bash --login
-module load singularity	
-unset LD_PRELOAD
-```
-2. Build the image: `singularity build ~/wm_rl_vla.sif singularity/wm_rl_vla.def`
-3. Execute inside the SIF (single GPU example):  
-   `singularity exec --nv --writable-tmpfs ~/wm_rl_vla.sif env MUJOCO_GL=osmesa USE_TF=0 USE_TB=0 MBPO_GPU=0 VLA_GPUS=0 RAY_NUM_GPUS=1 RAY_NUM_CPUS=8 RAY_OBJ_STORE_BYTES=2147483648 START_RAY=0 SCRATCH=/tmp WANDB_API_KEY='' bash examples/embodiment/run_wm_rl_vla.sh`
-   If EGL initialization fails (e.g., headless GPU driver missing `EGL_EXT_platform_device`), retry with software rendering: set `MUJOCO_GL=osmesa`.
-   If you hit TensorFlow import segfaults inside transformers, keep `USE_TF=0` (default) and optionally set `USE_TB=0` to disable TensorBoard.
-
-Notes:
-- `--writable-tmpfs` lets the run create symlinks for LIBERO assets inside the container.
-- `.singularity_pkgs/` contains local overlay installs (e.g., peft) used during debugging; it is not required on the server if the SIF already has the needed packages and can be ignored for commits.
-
+To reproduce the WM_VLA run used here:
+1. **Download LIBERO demos** (official release):
+   ```bash
+   mkdir -p iVideoGPT/datasets/libero_raw
+   wget -O iVideoGPT/datasets/libero_raw/libero_spatial.zip \
+     https://utexas.box.com/shared/static/04k94hyizn4huhbv5sz4ev9p2h1p6s7f.zip
+   unzip -o iVideoGPT/datasets/libero_raw/libero_spatial.zip -d iVideoGPT/datasets/libero_raw
+   ```
+2. Download the pretrained VGM from:
+  ```bash
+    https://huggingface.co/thuml/ivideogpt-oxe-64-act-free
+  ```
+3. **Convert to MBPO `.npz` demos** (stored under `iVideoGPT/mbrl/demonstrations/<suite>`):
+   ```bash
+   python iVideoGPT/datasets/convert_libero_demos.py \
+       --download-dir iVideoGPT/datasets/libero_raw \
+       --output-dir iVideoGPT/mbrl/demonstrations \
+       --suites libero_spatial
+       --rotate_180
+   ```
+4. Download the image SIF file.
+5. Execute inside the SIF (single GPU example):  
+  ```bash
+    /usr/bin/singularity exec --nv \
+    --bind /mnt/workspace/hanchu/nvidia-egl:/opt/nvidia-egl \
+    /mnt/workspace/hanchu/wm_rl_vla.sif env \
+    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+    TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1 \
+    MBPO_GPU=0 VLA_GPUS=1,2,3 \
+    MBPO_DEMO=true \
+    MBPO_EXTRA_ARGS="num_seed_frames=0 init_update_gen_steps=200 start_mbpo=0 init_gen_times=20 gen_every_steps=1 gen_batch=24 update_gen_times=1 world_model.batch_size=4 update_gen_every_step=2 +world_model.sync_every_steps=2" \
+    VLA_EXTRA_ARGS="runner.max_epochs=50 runner.val_check_interval=2 algorithm.num_group_envs=12 algorithm.rollout_epoch=4 actor.micro_batch_size=4 actor.global_batch_size=24 +rollout.sync_every_steps=1 env.eval.num_envs=6" \
+    bash /mnt/workspace/hanchu/wm_vla/examples/embodiment/run_wm_rl_vla_libero_spatial_mbpo_openpi_pi05_embodied.sh
+  ```
 
 ## What's NEW!
 - [2025/11] 🔥 RLinf supports reinforcement learning fine-tuning for [Behavior 1k](https://github.com/StanfordVL/BEHAVIOR-1K). Doc: [RL on Behavior 1k](https://rlinf.readthedocs.io/en/latest/rst_source/examples/behavior.html) 

@@ -79,9 +79,26 @@ class FSDP1Strategy(FSDPStrategyBase):
             self.cfg.fsdp_config.backward_prefetch
         )
 
+        ignored_modules = None
+        ignored_module_classes = self.cfg.fsdp_config.get(
+            "ignored_module_classes", []
+        )
+        if ignored_module_classes:
+            ignored_modules = [
+                module
+                for module in model.modules()
+                if module.__class__.__name__ in ignored_module_classes
+            ]
+            if len(ignored_modules) == 0:
+                self.logger.warning(
+                    "[FSDP] ignored_module_classes set but no modules matched."
+                )
+
+        param_init_fn = init_fn if self.cfg.fsdp_config.get("param_init_fn", True) else None
+
         fsdp_model = FSDP(
             module=model,
-            param_init_fn=init_fn,
+            param_init_fn=param_init_fn,
             auto_wrap_policy=auto_wrap_policy,
             device_id=int(os.environ["LOCAL_RANK"]),
             sharding_strategy=sharding_strategy,
@@ -92,6 +109,7 @@ class FSDP1Strategy(FSDPStrategyBase):
             backward_prefetch=backward_prefetch,
             limit_all_gathers=self.cfg.fsdp_config.limit_all_gathers,
             use_orig_params=self.cfg.fsdp_config.use_orig_params,
+            ignored_modules=ignored_modules,
         )
         return fsdp_model
 

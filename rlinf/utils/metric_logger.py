@@ -40,7 +40,12 @@ class MetricLogger:
 
         log_path = logger_cfg.get("log_path", "logs")
         project_name = logger_cfg.get("project_name", "rlinf")
+        project_name = logger_cfg.get("project", project_name)
         experiment_name = logger_cfg.get("experiment_name", "default")
+        entity = logger_cfg.get("entity", None) or logger_cfg.get("team", None)
+        group = logger_cfg.get("group", None)
+        team = logger_cfg.get("team", None)
+        org = logger_cfg.get("org", None)
 
         logger_backends = logger_cfg.get("logger_backends", ["tensorboard"])
         if isinstance(logger_backends, str):
@@ -69,12 +74,20 @@ class MetricLogger:
             settings = None
             if wandb_proxy:
                 settings = wandb.Settings(https_proxy=wandb_proxy)
+            tags = []
+            if team:
+                tags.append(f"team:{team}")
+            if org:
+                tags.append(f"org:{org}")
             wandb.init(
+                entity=entity,
                 project=project_name,
+                group=group,
                 name=experiment_name,
                 config=config,
                 settings=settings,
                 dir=wandb_log_path,
+                tags=tags if tags else None,
             )
             self.logger["wandb"] = wandb
 

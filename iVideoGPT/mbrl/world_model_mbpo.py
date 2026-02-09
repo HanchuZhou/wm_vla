@@ -6,9 +6,12 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import cv2
+import imageio
 import numpy as np
 import torch
+import torch.nn.functional as F
 from dm_env import StepType, specs
+from tqdm import tqdm
 
 from iVideoGPT.mbrl.replay_buffer import (
     ReplayBufferStorage,
@@ -56,6 +59,8 @@ class WorldModelMBPO:
         self.image_size = int(getattr(cfg, "image_size", 64))
         self.action_dim = int(cfg.actor.model.action_dim)
         self.num_action_chunks = int(cfg.actor.model.num_action_chunks)
+        self._target_image_size = self._infer_target_image_size()
+        self.state_dim = self._infer_state_dim()
 
         self.env_world_size = env_world_size
         self.stage_num = stage_num
@@ -160,6 +165,41 @@ class WorldModelMBPO:
                 interpolation=cv2.INTER_AREA,
             )
         return frame
+
+    def _infer_target_image_size(self) -> tuple[int, int]:
+        env_cfg = getattr(self.cfg, "env", None)
+        train_cfg = getattr(env_cfg, "train", None) if env_cfg is not None else None
+        init_params = (
+            getattr(train_cfg, "init_params", None) if train_cfg is not None else None
+        )
+        height = None
+        width = None
+        if init_params is not None:
+            height = getattr(init_params, "camera_heights", None) or getattr(
+                init_params, "camera_height", None
+            )
+            width = getattr(init_params, "camera_widths", None) or getattr(
+                init_params, "camera_width", None
+            )
+        if height is None or width is None:
+            size = getattr(train_cfg, "image_size", None) if train_cfg is not None else None
+            if size is None:
+                size = self.image_size
+            height = width = size
+        return int(height), int(width)
+
+    def _infer_state_dim(self) -> int:
+        state_dim = getattr(self.cfg.world_model, "state_dim", None)
+        if state_dim is not None:
+            return int(state_dim)
+        env_cfg = getattr(self.cfg, "env", None)
+        train_cfg = getattr(env_cfg, "train", None) if env_cfg is not None else None
+        sim_type = getattr(train_cfg, "simulator_type", None)
+        if sim_type == "libero":
+            return 8
+        if sim_type == "metaworld":
+            return 4
+        return int(getattr(self.cfg.actor.model, "action_dim", 0))
 
     def _to_chw_uint8(self, frame: Any) -> np.ndarray:
         if torch.is_tensor(frame):
@@ -293,9 +333,15 @@ class WorldModelMBPO:
         if torch.is_floating_point(image):
             if image.max() <= 1.0:
                 image = image * 255.0
-        image = image.to(torch.uint8)
+        image = image.float()
+        target_h, target_w = self._target_image_size
+        if image.shape[-2:] != (target_h, target_w):
+            image = F.interpolate(
+                image, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
+        image = image.clamp(0.0, 255.0).to(torch.uint8)
         batch = image.shape[0]
-        states = torch.zeros((batch, self.action_dim), dtype=torch.float32)
+        states = torch.zeros((batch, self.state_dim), dtype=torch.float32)
         if len(task_descriptions) == 1 and batch > 1:
             task_descriptions = task_descriptions * batch
         elif len(task_descriptions) != batch:
@@ -326,7 +372,15 @@ class WorldModelMBPO:
         if not self.init_model:
             if self.replay_storage._num_episodes == 0 and not self._has_demo:
                 return metrics
-            for idx in range(self.cfg.init_update_gen_steps):
+            init_iter = range(self.cfg.init_update_gen_steps)
+            if getattr(self.cfg.world_model, "show_progress", False):
+                init_iter = tqdm(
+                    init_iter,
+                    desc="WM init update",
+                    leave=False,
+                    ncols=120,
+                )
+            for idx in init_iter:
                 batch = next(self._get_seg_replay_iter())
                 update_tokenizer = getattr(
                     self.cfg.world_model, "seed_update_tokenizer", True
@@ -339,7 +393,15 @@ class WorldModelMBPO:
         if self.cfg.update_gen_every_step > 0 and env_steps % self.cfg.update_gen_every_step == 0:
             if self.replay_storage._num_episodes == 0 and not self._has_demo:
                 return metrics
-            for _ in range(self.cfg.update_gen_times):
+            update_iter = range(self.cfg.update_gen_times)
+            if getattr(self.cfg.world_model, "show_progress", False):
+                update_iter = tqdm(
+                    update_iter,
+                    desc="WM update",
+                    leave=False,
+                    ncols=120,
+                )
+            for _ in update_iter:
                 batch = next(self._get_seg_replay_iter())
                 update_tokenizer = (
                     env_steps
@@ -382,6 +444,12 @@ class WorldModelMBPO:
             horizon,
             do_sample=getattr(self.cfg.world_model, "rollout_do_sample", True),
         )
+        if obss is not None and obss.shape[1] > 0:
+            _, final_result = self._policy_predict(obss[:, -1], task_descs)
+            if "prev_values" in final_result:
+                rollout_result.prev_values.append(
+                    final_result["prev_values"].cpu().contiguous()
+                )
         rewards = rewards[:, 1:]
         if rewards.ndim == 2:
             rewards = rewards.unsqueeze(-1)
@@ -389,12 +457,111 @@ class WorldModelMBPO:
             rewards.shape[0], chunk_steps, self.num_action_chunks, -1
         )
         rewards = rewards.squeeze(-1).transpose(0, 1).contiguous()
-        dones = torch.zeros_like(rewards, dtype=torch.bool)
+        dones = torch.zeros(
+            (chunk_steps + 1, rewards.shape[1], rewards.shape[2]),
+            dtype=torch.bool,
+            device=rewards.device,
+        )
 
         rollout_batch = rollout_result.to_dict()
         rollout_batch["rewards"] = rewards.cpu().contiguous()
         rollout_batch["dones"] = dones.cpu().contiguous()
         return rollout_batch
+
+    def validate(
+        self,
+        global_step: int,
+        num_gifs: int = 0,
+        fps: int = 4,
+    ) -> dict[str, float]:
+        if self.replay_storage._num_episodes == 0 and not self._has_demo:
+            print("[stage] world model validate skipped (empty replay buffer and no demos)")
+            return {}
+        batch = next(self._get_seg_replay_iter())
+        obs_gt = torch.cat(
+            [batch[0][:, :-2], batch[0][:, 1:-1], batch[0][:, 2:]], dim=2
+        )
+        action = batch[1][:, 2:]
+        reward_gt = batch[2][:, 2:]
+        policy = lambda obs, step: action[:, step].to(obs.device)
+        obs_pred, _, reward_pred = self.video_predictor.rollout(
+            obs_gt[:, 0],
+            policy,
+            obs_gt.shape[1] - 1,
+            do_sample=False,
+        )
+
+        obs_mse = (
+            (obs_pred[:, 1:] - (obs_gt[:, 1:] / 255.0).to(obs_pred.device)) ** 2
+        ).mean()
+        reward_mse = (
+            (reward_pred[:, 1:] - reward_gt[:, 1:].to(reward_pred.device)) ** 2
+        ).mean()
+        action_norms = torch.linalg.norm(action, dim=-1).reshape(-1)
+        if action_norms.numel() > 0:
+            print(
+                "[validate] action_norm mean="
+                f"{action_norms.mean().item():.4f}, min={action_norms.min().item():.4f}, "
+                f"max={action_norms.max().item():.4f}"
+            )
+
+        if num_gifs > 0:
+            gif_dir = self.work_dir / "validate_gif"
+            gif_dir.mkdir(parents=True, exist_ok=True)
+            gif_count = min(int(num_gifs), int(obs_gt.shape[0]))
+            for i in range(gif_count):
+                gif_path = gif_dir / f"val-sample-{global_step}-{i}.gif"
+                frames = []
+                for t in range(obs_gt.shape[1]):
+                    frame = (
+                        obs_gt[i, t, -3:]
+                        .permute(1, 2, 0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    ).astype(np.uint8)
+                    frame = np.ascontiguousarray(frame)
+                    frame_pred = (
+                        obs_pred[i, t, -3:]
+                        .permute(1, 2, 0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        * 255.0
+                    ).astype(np.uint8)
+                    frame_pred = np.ascontiguousarray(frame_pred)
+                    frame_error = np.abs(
+                        frame.astype(np.float32) - frame_pred.astype(np.float32)
+                    ).astype(np.uint8)
+                    if t > 0:
+                        cv2.putText(
+                            frame,
+                            f"{reward_gt[i, t].item():.2f}",
+                            (10, 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.3,
+                            (255, 255, 255),
+                            1,
+                        )
+                        cv2.putText(
+                            frame_pred,
+                            f"{reward_pred[i, t].item():.2f}",
+                            (10, 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.3,
+                            (255, 255, 255),
+                            1,
+                        )
+                    frames.append(np.concatenate([frame, frame_pred, frame_error], axis=1))
+                imageio.mimsave(str(gif_path), frames, fps=fps, loop=0)
+
+        return {
+            "val/obs_mse": obs_mse.item(),
+            "val/reward_mse": reward_mse.item(),
+            "val/action_norm_mean": action_norms.mean().item() if action_norms.numel() else 0.0,
+            "val/action_norm_min": action_norms.min().item() if action_norms.numel() else 0.0,
+            "val/action_norm_max": action_norms.max().item() if action_norms.numel() else 0.0,
+        }
 
     def should_start_mbpo(self, env_steps: int) -> bool:
         return env_steps >= self.cfg.start_mbpo

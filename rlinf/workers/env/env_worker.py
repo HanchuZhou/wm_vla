@@ -385,7 +385,9 @@ class EnvWorker(Worker):
             for i in range(self.stage_num):
                 self.simulator_list[i].update_reset_state_ids()
         elif mode == "eval":
-            if self.cfg.env.eval.video_cfg.save_video:
+            eval_video_cfg = self.cfg.env.eval.video_cfg
+            rank0_only = getattr(eval_video_cfg, "rank0_only", False)
+            if eval_video_cfg.save_video and (not rank0_only or self._rank == 0):
                 for i in range(self.stage_num):
                     self.eval_simulator_list[i].flush_video()
 

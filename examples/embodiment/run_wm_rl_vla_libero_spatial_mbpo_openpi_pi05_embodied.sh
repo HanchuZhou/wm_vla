@@ -11,6 +11,7 @@ MBPO_TASK_NAME="${MBPO_TASK_NAME:-libero_spatial}"
 MBPO_CONFIG="${MBPO_CONFIG:-libero_spatial_mbpo_openpi_pi05}"
 MBPO_FRAMES="${MBPO_FRAMES:-1000002}"
 MBPO_DEMO="${MBPO_DEMO:-true}"
+MBPO_WM_UPDATE_EVERY="${MBPO_WM_UPDATE_EVERY:-}"
 MBPO_GPU="${MBPO_GPU:-0}"
 VLA_GPUS="${VLA_GPUS:-1,2,3}"
 
@@ -77,6 +78,9 @@ mkdir -p "${LOG_DIR}"
 EXTRA_ARGS=()
 if [[ -n "${MBPO_EXTRA_ARGS:-}" ]]; then
   read -r -a EXTRA_ARGS <<< "${MBPO_EXTRA_ARGS}"
+fi
+if [[ -n "${MBPO_WM_UPDATE_EVERY}" ]]; then
+  EXTRA_ARGS+=("update_gen_every_step=${MBPO_WM_UPDATE_EVERY}")
 fi
 if [[ -n "${VLA_EXTRA_ARGS:-}" ]]; then
   read -r -a VLA_ARGS <<< "${VLA_EXTRA_ARGS}"

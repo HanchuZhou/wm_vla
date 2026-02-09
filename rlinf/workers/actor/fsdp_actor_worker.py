@@ -746,9 +746,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if key not in self.rollout_batch or self.rollout_batch[key] is None:
                 self.rollout_batch[key] = value
             else:
-                self.rollout_batch[key] = torch.cat(
-                    [self.rollout_batch[key], value], dim=1
-                )
+                try:
+                    self.rollout_batch[key] = torch.cat(
+                        [self.rollout_batch[key], value], dim=1
+                    )
+                except RuntimeError as err:
+                    ref_shape = (
+                        tuple(self.rollout_batch[key].shape)
+                        if isinstance(self.rollout_batch[key], torch.Tensor)
+                        else None
+                    )
+                    extra_shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+                    raise RuntimeError(
+                        f"append_rollout_batch failed for key={key} "
+                        f"ref_shape={ref_shape} extra_shape={extra_shape}"
+                    ) from err
 
         if (
             not self.cfg.env.train.auto_reset
@@ -761,6 +773,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 loss_mask_sum = loss_mask_sum[..., -1:]
             self.rollout_batch["loss_mask"] = loss_mask
             self.rollout_batch["loss_mask_sum"] = loss_mask_sum
+
+    def clear_rollout_batch(self):
+        self.rollout_batch = None
+
+    def has_rollout_batch(self) -> bool:
+        return hasattr(self, "rollout_batch") and self.rollout_batch is not None
 
     def run_training(self):
         if self.cfg.actor.get("enable_offload", False):
@@ -803,9 +821,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         rollout_size = self.rollout_batch["prev_logprobs"].size(0)
         batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
-        assert rollout_size % batch_size_per_rank == 0, (
-            f"{rollout_size} is not divisible by {batch_size_per_rank}"
-        )
+        if rollout_size % batch_size_per_rank != 0:
+            trimmed_size = rollout_size - (rollout_size % batch_size_per_rank)
+            if trimmed_size <= 0:
+                raise ValueError(
+                    f"rollout_size={rollout_size} too small for batch_size_per_rank={batch_size_per_rank}"
+                )
+            if self._rank == 0:
+                print(
+                    f"[warn] trimming rollout_size from {rollout_size} to {trimmed_size} "
+                    f"to match batch_size_per_rank={batch_size_per_rank}"
+                )
+            for key, value in self.rollout_batch.items():
+                if value is None or "env_info" in key:
+                    continue
+                self.rollout_batch[key] = value[:trimmed_size]
+            rollout_size = trimmed_size
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):

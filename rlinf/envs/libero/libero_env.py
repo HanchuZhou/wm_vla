@@ -46,6 +46,7 @@ class LiberoEnv(gym.Env):
         self.cfg = cfg
         self.total_num_processes = total_num_processes
         self.seed = self.cfg.seed + seed_offset
+        self._maybe_set_mujoco_egl_device_id()
         self._is_start = True
         self.num_envs = self.cfg.num_envs
         self.group_size = self.cfg.group_size
@@ -77,6 +78,20 @@ class LiberoEnv(gym.Env):
         self.video_cnt = 0
         self.render_images = []
         self.current_raw_obs = None
+
+    def _maybe_set_mujoco_egl_device_id(self) -> None:
+        if os.environ.get("MUJOCO_GL") != "egl":
+            return
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if not visible:
+            return
+        visible_ids = [v.strip() for v in visible.split(",") if v.strip() != ""]
+        if not visible_ids:
+            return
+        desired = visible_ids[0]
+        current = os.environ.get("MUJOCO_EGL_DEVICE_ID")
+        if current is None or current not in visible_ids:
+            os.environ["MUJOCO_EGL_DEVICE_ID"] = desired
 
     def _init_env(self):
         env_fns = self.get_env_fns()
@@ -488,13 +503,21 @@ class LiberoEnv(gym.Env):
         self.render_images.append(full_image)
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
-        output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
+        use_seed_subdir = getattr(self.video_cfg, "use_seed_subdir", True)
+        if use_seed_subdir:
+            output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
+        else:
+            output_dir = self.video_cfg.video_base_dir
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
+        video_format = getattr(self.video_cfg, "format", "mp4")
+        video_fps = int(getattr(self.video_cfg, "fps", 30))
         save_rollout_video(
             self.render_images,
             output_dir=output_dir,
             video_name=f"{self.video_cnt}",
+            fps=video_fps,
+            fmt=video_format,
         )
         self.video_cnt += 1
         self.render_images = []

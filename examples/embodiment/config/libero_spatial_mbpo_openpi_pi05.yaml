@@ -23,14 +23,21 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
+    project: ${task_name}
+    entity: flare-robot
+    team: flare-robot
+    org: ucd-dare
     experiment_name: "libero_spatial_mbpo_openpi_pi05"
-    logger_backends: ["tensorboard"]
+    logger_backends: ["tensorboard", "wandb"]
 
   max_epochs: 1000
   max_steps: -1
 
-  val_check_interval: -1
-  save_interval: 40
+  val_check_interval: 2
+  save_eval_and_val_gif: true
+  num_gif_every_steps: 3
+  real_rollout_every_steps: -1
+  save_interval: -1 # for checkpoint saving, not for gif saving
   seq_length: 4096
   max_prompt_length: 50
 
@@ -42,7 +49,7 @@ frame_stack: 3
 action_repeat: 1
 discount: 0.99
 num_train_frames: 1000002
-num_seed_frames: 2000
+num_seed_frames: 0
 num_eval_episodes: 10
 
 save_snapshot: true
@@ -61,16 +68,16 @@ save_video: true
 save_train_video: false
 use_tb: ${oc.env:USE_TB,false}
 
-gen_every_steps: 200
+gen_every_steps: 1
 gen_batch: 32
 gen_horizon: 10
-update_gen_every_step: 100
-update_tokenizer_every_step: 40
+update_gen_every_step: 2
+update_tokenizer_every_step: 2
 update_gen_times: 1
 init_update_gen_steps: 1000
 init_gen_times: 20
 real_ratio: 0.5
-start_mbpo: 4000
+start_mbpo: 5
 
 world_model:
   enable: true
@@ -97,6 +104,7 @@ world_model:
   context_length: 2
   segment_length: 12
   action_dim: ${actor.model.action_dim}
+  state_dim: 8
 
   batch_size: 16
   selected_params: true
@@ -114,6 +122,7 @@ world_model:
   reward_lr: 1e-4
   reward_wd: 1e-6
   reward_weight: 1.0
+  show_progress: true
 
 # ===== RLinf algorithm =====
 algorithm:
@@ -127,8 +136,8 @@ algorithm:
   use_ordered_reset_state_ids: False
   reward_coef: 1.0
   n_chunk_steps: 48
-  n_eval_chunk_steps: 48
-  num_group_envs: 64
+  n_eval_chunk_steps: ${int_div:${env.eval.max_episode_steps}, ${actor.model.num_action_chunks}}
+  num_group_envs: 64  # For advantage grouping
   rollout_epoch: 8
   reward_type: chunk_level
   logprob_type: chunk_level
@@ -174,6 +183,9 @@ env:
     queue_name: "obs_buffer"
     queue_size: 0
   enable_offload: False
+  train:
+    video_cfg:
+      save_video: False
 
 rollout:
   group_name: "RolloutGroup"
@@ -240,7 +252,7 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "full_shard"
+    sharding_strategy: "no_shard"
     cpu_offload: False
     offload_pin_memory: False
     reshard_after_forward: True

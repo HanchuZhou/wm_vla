@@ -21,6 +21,10 @@ video_cfg:
   save_video: True
   info_on_video: True
   video_base_dir: ${runner.logger.log_path}/video/eval
+  format: gif
+  fps: 4
+  use_seed_subdir: false
+  rank0_only: true
 
 init_params:
   camera_heights: 256

@@ -222,18 +222,29 @@ def quat2axisangle(quat: np.ndarray) -> np.ndarray:
 
 
 def save_rollout_video(
-    rollout_images: list[np.ndarray], output_dir: str, video_name: str, fps: int = 30
+    rollout_images: list[np.ndarray],
+    output_dir: str,
+    video_name: str,
+    fps: int = 30,
+    fmt: str = "mp4",
 ) -> None:
     """
-    Saves an MP4 replay of an episode.
+    Saves a replay of an episode as MP4 or GIF.
 
     Args:
         rollout_images: List of images from the episode
         output_dir: Directory to save the video
         video_name: Name of the output video file
         fps: Frames per second for the video
+        fmt: "mp4" or "gif"
     """
     os.makedirs(output_dir, exist_ok=True)
+    fmt = (fmt or "mp4").lower()
+    if fmt == "gif":
+        gif_path = os.path.join(output_dir, f"{video_name}.gif")
+        imageio.mimsave(gif_path, rollout_images, fps=fps, loop=0)
+        return
+
     mp4_path = os.path.join(output_dir, f"{video_name}.mp4")
     video_writer = imageio.get_writer(mp4_path, fps=fps)
     for img in rollout_images:

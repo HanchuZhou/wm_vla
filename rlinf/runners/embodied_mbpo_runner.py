@@ -1,5 +1,7 @@
 import asyncio
 import os
+import time
+from pathlib import Path
 from typing import Optional
 
 from omegaconf.dictconfig import DictConfig
@@ -96,12 +98,54 @@ class EmbodiedMBPORunner:
                 drained += self.world_model.ingest_step(payload)
         return drained
 
+    def _log_wandb_gifs(
+        self,
+        base_dir: str | os.PathLike,
+        key_prefix: str,
+        max_gifs: int,
+        fps: int = 4,
+    ) -> None:
+        if max_gifs <= 0:
+            return
+        base_path = Path(base_dir)
+        if not base_path.exists():
+            return
+        gif_paths = sorted(
+            base_path.rglob("*.gif"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+            reverse=True,
+        )
+        if not gif_paths:
+            return
+        gif_paths = gif_paths[:max_gifs]
+        wandb = self.metric_logger.logger.get("wandb", None)
+        if wandb is None:
+            return
+        payload = {}
+        for idx, gif_path in enumerate(gif_paths):
+            try:
+                payload[f"{key_prefix}_{idx}"] = wandb.Video(
+                    str(gif_path), fps=fps, format="gif"
+                )
+            except Exception:
+                continue
+        if payload:
+            wandb.log(payload, step=self.global_step, commit=True)
+
     def _world_model_env_steps(self) -> int:
         if self.world_model is None:
             return 0
         if self.world_model.total_envs <= 0:
             return self.world_model.total_env_steps
         return self.world_model.total_env_steps // self.world_model.total_envs
+
+    def _should_use_real_rollout_for_vla(self) -> bool:
+        every = int(getattr(self.cfg.runner, "real_rollout_every_steps", 1))
+        if every <= 0:
+            return False
+        if every == 1:
+            return True
+        return self.global_step > 0 and (self.global_step % every) == 0
 
     def generate_rollouts(self):
         env_futures = self.env.interact()
@@ -126,6 +170,18 @@ class EmbodiedMBPORunner:
 
     def run(self):
         start_step = self.global_step
+        if self.world_model is not None and not self.world_model.init_model:
+            print("[stage] world model demo finetuning start")
+            t0 = time.perf_counter()
+            wm_metrics = self.world_model.maybe_update_world_model(self.global_step)
+            t1 = time.perf_counter()
+            duration = t1 - t0
+            print(f"[stage] world model demo finetuning end (duration={duration:.2f}s)")
+            self.metric_logger.log({"time/wm_init": duration}, self.global_step)
+            if wm_metrics:
+                self.metric_logger.log(wm_metrics, self.global_step)
+            if not self.world_model.init_model:
+                print("[stage] world model demo finetuning skipped (no demo data)")
         global_pbar = tqdm(
             initial=start_step,
             total=self.max_steps,
@@ -145,48 +201,171 @@ class EmbodiedMBPORunner:
                     eval_metrics = self.evaluate()
                     eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                     self.metric_logger.log(data=eval_metrics, step=_step)
+                    save_eval_and_val_gif = bool(
+                        self.cfg.runner.get("save_eval_and_val_gif", True)
+                    )
+                    num_gifs = int(self.cfg.runner.get("num_gif_every_steps", 0))
+                    if save_eval_and_val_gif and num_gifs > 0:
+                        eval_video_cfg = self.cfg.env.eval.video_cfg
+                        if getattr(eval_video_cfg, "save_video", False):
+                            eval_fps = int(getattr(eval_video_cfg, "fps", 4))
+                            self._log_wandb_gifs(
+                                getattr(eval_video_cfg, "video_base_dir", "video/eval"),
+                                "eval/gif",
+                                num_gifs,
+                                fps=eval_fps,
+                            )
+                        if self.world_model is not None:
+                            wm_val_metrics = self.world_model.validate(
+                                global_step=self.global_step,
+                                num_gifs=num_gifs,
+                                fps=4,
+                            )
+                            if wm_val_metrics:
+                                self.metric_logger.log(wm_val_metrics, step=_step)
+                            self._log_wandb_gifs(
+                                self.world_model.work_dir / "validate_gif",
+                                "validate/gif",
+                                num_gifs,
+                                fps=4,
+                            )
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
                     self.update_rollout_weights()
                     self._sync_world_model_policy()
                 with self.timer("generate_rollouts"):
+                    print(f"[stage] real rollout start step={self.global_step}")
+                    t0 = time.perf_counter()
                     env_metrics = self.generate_rollouts()
+                    t1 = time.perf_counter()
+                    duration = t1 - t0
+                    print(
+                        f"[stage] real rollout end step={self.global_step} "
+                        f"(duration={duration:.2f}s)"
+                    )
+                    self.metric_logger.log(
+                        {"time/real_rollout": duration}, self.global_step
+                    )
                     self._drain_wm_channel()
+                use_real_rollout = self._should_use_real_rollout_for_vla()
+                print(
+                    f"[stage] real rollout for vla="
+                    f"{'yes' if use_real_rollout else 'no'} step={self.global_step}"
+                )
+                if not use_real_rollout:
+                    self.actor.clear_rollout_batch().wait()
 
                 wm_metrics = {}
                 if self.world_model is not None:
                     with self.timer("world_model"):
-                        env_steps = self._world_model_env_steps()
-                        wm_metrics.update(
-                            self.world_model.maybe_update_world_model(env_steps)
+                        wm_step = self.global_step
+                        will_init = not self.world_model.init_model
+                        will_update = (
+                            self.world_model.init_model
+                            and self.cfg.update_gen_every_step > 0
+                            and wm_step % self.cfg.update_gen_every_step == 0
                         )
-                        if self.world_model.should_start_mbpo(env_steps):
+                        if will_init:
+                            print(
+                                "[stage] world model demo finetuning start "
+                                f"step={self.global_step}"
+                            )
+                        elif will_update:
+                            print(
+                                "[stage] world model update start "
+                                f"step={self.global_step}"
+                            )
+                        wm_update_t0 = time.perf_counter()
+                        wm_metrics.update(
+                            self.world_model.maybe_update_world_model(wm_step)
+                        )
+                        wm_update_t1 = time.perf_counter()
+                        if wm_metrics:
+                            update_duration = wm_update_t1 - wm_update_t0
+                            if any(k.startswith("wm_init/") for k in wm_metrics):
+                                print(
+                                    "[stage] world model demo finetuning end "
+                                    f"(duration={update_duration:.2f}s)"
+                                )
+                                self.metric_logger.log(
+                                    {"time/wm_init": update_duration},
+                                    self.global_step,
+                                )
+                            else:
+                                print(
+                                    "[stage] world model update end "
+                                    f"(duration={update_duration:.2f}s)"
+                                )
+                                self.metric_logger.log(
+                                    {"time/wm_update": update_duration},
+                                    self.global_step,
+                                )
+                        # MBPO starts
+                        if self.world_model.init_model and self.world_model.should_start_mbpo(wm_step):
                             if not self.world_model.init_gen:
                                 for _ in range(self.cfg.init_gen_times):
+                                    print(
+                                        "[stage] world model generation start "
+                                        f"(init) step={self.global_step}"
+                                    )
+                                    t0 = time.perf_counter()
                                     imagined = self.world_model.generate_imagined_rollout(
                                         self.cfg.algorithm.n_chunk_steps
+                                    )
+                                    t1 = time.perf_counter()
+                                    duration = t1 - t0
+                                    print(
+                                        "[stage] world model generation end "
+                                        f"(duration={duration:.2f}s)"
+                                    )
+                                    self.metric_logger.log(
+                                        {"time/wm_gen": duration}, self.global_step
                                     )
                                     if imagined is not None:
                                         self.actor.append_rollout_batch(imagined).wait()
                                 self.world_model.init_gen = True
                             elif (
                                 self.cfg.gen_every_steps > 0
-                                and env_steps % self.cfg.gen_every_steps == 0
+                                and wm_step % self.cfg.gen_every_steps == 0
                             ):
+                                print(
+                                    "[stage] world model generation start "
+                                    f"step={self.global_step}"
+                                )
+                                t0 = time.perf_counter()
                                 imagined = self.world_model.generate_imagined_rollout(
                                     self.cfg.algorithm.n_chunk_steps
+                                )
+                                t1 = time.perf_counter()
+                                duration = t1 - t0
+                                print(
+                                    "[stage] world model generation end "
+                                    f"(duration={duration:.2f}s)"
+                                )
+                                self.metric_logger.log(
+                                    {"time/wm_gen": duration}, self.global_step
                                 )
                                 if imagined is not None:
                                     self.actor.append_rollout_batch(imagined).wait()
 
-                with self.timer("cal_adv_and_returns"):
-                    actor_futures = self.actor.compute_advantages_and_returns()
-                    actor_rollout_metrics = actor_futures.wait()
+                if self.world_model is not None and not self.world_model.init_model:
+                    print(
+                        "[stage] skipping vla update until world model init completes"
+                    )
+                    self.actor.clear_rollout_batch().wait()
 
-                with self.timer("actor_training"):
-                    actor_training_futures = self.actor.run_training()
-                    actor_training_metrics = actor_training_futures.wait()
+                has_rollout = self.actor.has_rollout_batch().wait()[0]
+                actor_rollout_metrics = [{}]
+                actor_training_metrics = [{}]
+                if has_rollout:
+                    with self.timer("cal_adv_and_returns"):
+                        actor_futures = self.actor.compute_advantages_and_returns()
+                        actor_rollout_metrics = actor_futures.wait()
+
+                    with self.timer("actor_training"):
+                        actor_training_futures = self.actor.run_training()
+                        actor_training_metrics = actor_training_futures.wait()
 
                 self.global_step += 1
 

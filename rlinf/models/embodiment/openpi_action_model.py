@@ -153,9 +153,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch):
                 if hasattr(token, "ndim") and token.ndim > 2 and token.shape[1] == 1:
                     inputs[key] = token[:, 0]
         # tensor -> numpy
-        inputs = jax.tree.map(
-            lambda x: np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x, inputs
-        )
+        def _to_numpy(x):
+            if not torch.is_tensor(x):
+                return x
+            x = x.detach().cpu()
+            if x.dtype in (torch.bfloat16, torch.float16):
+                x = x.float()
+            return np.asarray(x)
+
+        inputs = jax.tree.map(_to_numpy, inputs)
         batch_size = next(v.shape[0] for v in inputs.values() if hasattr(v, "shape"))
         # split & transform
         transformed_samples = []

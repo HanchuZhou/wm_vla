@@ -125,14 +125,7 @@ Prepare LIBERO demonstrations and enable MBPO demo seeding:
        --download-dir iVideoGPT/datasets/libero_raw \
        --output-dir iVideoGPT/mbrl/demonstrations \
        --suites libero_spatial
-   ```
-   If validation GIFs look upside down with demos enabled, re-run conversion with `--flip-vertical`:
-   ```bash
-   python iVideoGPT/datasets/convert_libero_demos.py \
-       --download-dir iVideoGPT/datasets/libero_raw \
-       --output-dir iVideoGPT/mbrl/demonstrations \
-       --suites libero_spatial \
-       --flip-vertical
+       --rotate_180
    ```
 3. **Launch LIBERO MBPO** (demo seeding enabled by default in configs):
    ```bash

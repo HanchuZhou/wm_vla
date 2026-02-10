@@ -38,11 +38,7 @@ To reproduce the WM_VLA run used here:
      https://utexas.box.com/shared/static/04k94hyizn4huhbv5sz4ev9p2h1p6s7f.zip
    unzip -o iVideoGPT/datasets/libero_raw/libero_spatial.zip -d iVideoGPT/datasets/libero_raw
    ```
-2. Download the pretrained VGM from:
-  ```bash
-    https://huggingface.co/thuml/ivideogpt-oxe-64-act-free
-  ```
-3. **Convert to MBPO `.npz` demos** (stored under `iVideoGPT/mbrl/demonstrations/<suite>`):
+2. **Convert to MBPO `.npz` demos** (stored under `iVideoGPT/mbrl/demonstrations/<suite>`):
    ```bash
    python iVideoGPT/datasets/convert_libero_demos.py \
        --download-dir iVideoGPT/datasets/libero_raw \
@@ -50,8 +46,22 @@ To reproduce the WM_VLA run used here:
        --suites libero_spatial
        --rotate_180
    ```
-4. Download the image SIF file.
-5. Execute inside the SIF (single GPU example):  
+3. Download the pretrained VGM from:
+  ```bash
+    https://huggingface.co/thuml/ivideogpt-oxe-64-act-free
+  ```
+4. Download the VLA:
+  ```bash
+    huggingface-cli download RLinf/RLinf-Pi05-SFT \
+    --local-dir pretrained_models/RLinf-Pi05-SFT \
+    --local-dir-use-symlinks False
+
+  ```
+5. Download the image SIF file:
+  ```bash
+    huggingface-cli download HanchuZhou/wm-rl-vla-sif
+  ```
+6. Execute inside the SIF (single GPU example):  
   ```bash
     /usr/bin/singularity exec --nv \
     --bind /mnt/workspace/hanchu/nvidia-egl:/opt/nvidia-egl \

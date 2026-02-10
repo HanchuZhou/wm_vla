@@ -471,7 +471,7 @@ class WorldModelMBPO:
     def validate(
         self,
         global_step: int,
-        num_gifs: int = 0,
+        num_gifs: int = 1,
         fps: int = 4,
     ) -> dict[str, float]:
         if self.replay_storage._num_episodes == 0 and not self._has_demo:

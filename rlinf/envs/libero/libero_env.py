@@ -77,6 +77,7 @@ class LiberoEnv(gym.Env):
         self.video_cfg = cfg.video_cfg
         self.video_cnt = 0
         self.render_images = []
+        self._video_stop_recording = False
         self.current_raw_obs = None
 
     def _maybe_set_mujoco_egl_device_id(self) -> None:
@@ -371,6 +372,7 @@ class LiberoEnv(gym.Env):
         obs = self._wrap_obs(raw_obs)
 
         step_reward = self._calc_step_reward(terminations)
+        infos = self._record_metrics(step_reward, terminations, infos)
 
         if self.video_cfg.save_video:
             plot_infos = {
@@ -379,8 +381,6 @@ class LiberoEnv(gym.Env):
                 "task": self.task_descriptions,
             }
             self.add_new_frames(raw_obs, plot_infos)
-
-        infos = self._record_metrics(step_reward, terminations, infos)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
@@ -491,16 +491,28 @@ class LiberoEnv(gym.Env):
             return reward
 
     def add_new_frames(self, raw_obs, plot_infos):
+        if self._video_stop_recording:
+            return
+        max_render_envs = int(getattr(self.video_cfg, "max_render_envs", 1))
+        max_render_envs = max(1, min(max_render_envs, len(raw_obs)))
         images = []
-        for env_id, raw_single_obs in enumerate(raw_obs):
+        render_ids = list(range(max_render_envs))
+        for env_id in render_ids:
+            raw_single_obs = raw_obs[env_id]
             info_item = {
                 k: v if np.size(v) == 1 else v[env_id] for k, v in plot_infos.items()
             }
             img = raw_single_obs["agentview_image"][::-1, ::-1]
             img = put_info_on_image(img, info_item)
             images.append(img)
-        full_image = tile_images(images, nrows=int(np.sqrt(self.num_envs)))
+        full_image = tile_images(images, nrows=int(np.sqrt(max_render_envs)))
         self.render_images.append(full_image)
+        stop_on_success = bool(getattr(self.video_cfg, "stop_on_success", False))
+        if stop_on_success:
+            for env_id in render_ids:
+                if self.success_once[env_id]:
+                    self._video_stop_recording = True
+                    break
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
         use_seed_subdir = getattr(self.video_cfg, "use_seed_subdir", True)
@@ -521,3 +533,4 @@ class LiberoEnv(gym.Env):
         )
         self.video_cnt += 1
         self.render_images = []
+        self._video_stop_recording = False

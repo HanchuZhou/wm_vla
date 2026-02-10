@@ -44,6 +44,38 @@ class EmbodiedMBPORunner:
 
         self.timer = ScopedTimer(reduction="max", sync_cuda=False)
         self.metric_logger = MetricLogger(cfg)
+        self.real_env_interactions = 0.0
+        self._setup_wandb_metric_axes()
+
+    def _setup_wandb_metric_axes(self) -> None:
+        wandb = self.metric_logger.logger.get("wandb", None)
+        if wandb is None:
+            return
+        try:
+            wandb.define_metric("env/real_interactions")
+            wandb.define_metric(
+                "eval/success_once_vs_real_env_interactions",
+                step_metric="env/real_interactions",
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_to_float(value, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            if hasattr(value, "sum"):
+                value = value.sum()
+            if hasattr(value, "item"):
+                return float(value.item())
+            return float(value)
+        except Exception:
+            return default
 
     def init_workers(self):
         self.actor.init_worker().wait()
@@ -110,27 +142,57 @@ class EmbodiedMBPORunner:
         base_path = Path(base_dir)
         if not base_path.exists():
             return
-        gif_paths = sorted(
-            base_path.rglob("*.gif"),
-            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+        media_paths = []
+        for pattern in ("*.gif", "*.mp4"):
+            media_paths.extend(base_path.rglob(pattern))
+        media_paths = sorted(
+            [p for p in media_paths if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
-        if not gif_paths:
+        if not media_paths:
             return
-        gif_paths = gif_paths[:max_gifs]
+        media_paths = media_paths[:max_gifs]
         wandb = self.metric_logger.logger.get("wandb", None)
         if wandb is None:
             return
         payload = {}
-        for idx, gif_path in enumerate(gif_paths):
+        for idx, media_path in enumerate(media_paths):
+            fmt = media_path.suffix.lower().lstrip(".")
+            if fmt not in {"gif", "mp4"}:
+                continue
             try:
                 payload[f"{key_prefix}_{idx}"] = wandb.Video(
-                    str(gif_path), fps=fps, format="gif"
+                    str(media_path), fps=fps, format=fmt
                 )
-            except Exception:
+            except Exception as exc:
+                print(f"[warn] failed to log media to wandb: {media_path} ({exc})")
                 continue
         if payload:
-            wandb.log(payload, step=self.global_step, commit=True)
+            wandb.log(payload, step=self.global_step)
+
+    def _world_model_status_metrics(
+        self,
+        wm_metrics: dict[str, float],
+        use_real_rollout: bool,
+    ) -> dict[str, float]:
+        if self.world_model is None:
+            return {}
+        update_every = int(getattr(self.cfg, "update_gen_every_step", 0))
+        mbpo_active = (
+            self.world_model.init_model
+            and self.world_model.should_start_mbpo(self.global_step)
+        )
+        return {
+            "wm/status/init_model": float(self.world_model.init_model),
+            "wm/status/init_gen": float(self.world_model.init_gen),
+            "wm/status/mbpo_active": float(mbpo_active),
+            "wm/status/use_real_rollout": float(use_real_rollout),
+            "wm/status/env_steps": float(self._world_model_env_steps()),
+            "wm/status/replay_episodes": float(self.world_model.replay_storage._num_episodes),
+            "wm/status/updated": float(bool(wm_metrics)),
+            "wm/status/update_every": float(update_every),
+        }
 
     def _world_model_env_steps(self) -> int:
         if self.world_model is None:
@@ -155,9 +217,22 @@ class EmbodiedMBPORunner:
         actor_futures.wait()
         rollout_futures.wait()
 
-        env_results_list = [results for results in env_results if results is not None]
-        env_metrics = compute_evaluate_metrics(env_results_list)
-        return env_metrics
+        real_env_interactions = 0.0
+        env_results_list = []
+        for results in env_results:
+            if results is None:
+                continue
+            clean = dict(results)
+            real_env_interactions += self._safe_to_float(
+                clean.pop("__real_env_interactions__", 0.0)
+            )
+            if clean:
+                env_results_list.append(clean)
+
+        env_metrics = (
+            compute_evaluate_metrics(env_results_list) if env_results_list else {}
+        )
+        return env_metrics, real_env_interactions
 
     def evaluate(self):
         env_futures = self.env.evaluate()
@@ -200,11 +275,16 @@ class EmbodiedMBPORunner:
                     self.update_rollout_weights()
                     eval_metrics = self.evaluate()
                     eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                    if "eval/success_once" in eval_metrics:
+                        eval_metrics["eval/success_once_vs_real_env_interactions"] = (
+                            eval_metrics["eval/success_once"]
+                        )
+                    eval_metrics["env/real_interactions"] = self.real_env_interactions
                     self.metric_logger.log(data=eval_metrics, step=_step)
                     save_eval_and_val_gif = bool(
                         self.cfg.runner.get("save_eval_and_val_gif", True)
                     )
-                    num_gifs = int(self.cfg.runner.get("num_gif_every_steps", 0))
+                    num_gifs = int(self.cfg.runner.get("num_gif_every_steps", 1))
                     if save_eval_and_val_gif and num_gifs > 0:
                         eval_video_cfg = self.cfg.env.eval.video_cfg
                         if getattr(eval_video_cfg, "save_video", False):
@@ -237,7 +317,7 @@ class EmbodiedMBPORunner:
                 with self.timer("generate_rollouts"):
                     print(f"[stage] real rollout start step={self.global_step}")
                     t0 = time.perf_counter()
-                    env_metrics = self.generate_rollouts()
+                    env_metrics, real_env_interactions = self.generate_rollouts()
                     t1 = time.perf_counter()
                     duration = t1 - t0
                     print(
@@ -247,7 +327,13 @@ class EmbodiedMBPORunner:
                     self.metric_logger.log(
                         {"time/real_rollout": duration}, self.global_step
                     )
-                    self._drain_wm_channel()
+                    drained = float(self._drain_wm_channel())
+                    if drained > 0:
+                        real_env_interactions = drained
+                    self.real_env_interactions += real_env_interactions
+                    real_env_metrics = {
+                        "env/real_interactions": self.real_env_interactions
+                    }
                 use_real_rollout = self._should_use_real_rollout_for_vla()
                 print(
                     f"[stage] real rollout for vla="
@@ -349,6 +435,13 @@ class EmbodiedMBPORunner:
                                 if imagined is not None:
                                     self.actor.append_rollout_batch(imagined).wait()
 
+                wm_status_metrics = {}
+                if self.world_model is not None:
+                    wm_status_metrics = self._world_model_status_metrics(
+                        wm_metrics=wm_metrics,
+                        use_real_rollout=use_real_rollout,
+                    )
+
                 if self.world_model is not None and not self.world_model.init_model:
                     print(
                         "[stage] skipping vla update until world model init completes"
@@ -395,8 +488,11 @@ class EmbodiedMBPORunner:
             self.metric_logger.log(rollout_metrics, _step)
             self.metric_logger.log(time_metrics, _step)
             self.metric_logger.log(training_metrics, _step)
+            self.metric_logger.log(real_env_metrics, _step)
             if wm_metrics:
                 self.metric_logger.log(wm_metrics, _step)
+            if wm_status_metrics:
+                self.metric_logger.log(wm_status_metrics, _step)
 
             logging_metrics = {}
             logging_metrics.update(time_metrics)
@@ -404,8 +500,11 @@ class EmbodiedMBPORunner:
             logging_metrics.update(env_metrics)
             logging_metrics.update(rollout_metrics)
             logging_metrics.update(training_metrics)
+            logging_metrics.update(real_env_metrics)
             if wm_metrics:
                 logging_metrics.update(wm_metrics)
+            if wm_status_metrics:
+                logging_metrics.update(wm_status_metrics)
 
             global_pbar.set_postfix(logging_metrics)
             global_pbar.update(1)

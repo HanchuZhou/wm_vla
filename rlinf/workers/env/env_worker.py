@@ -335,7 +335,7 @@ class EnvWorker(Worker):
         """
         chunk_actions = prepare_actions(
             raw_chunk_actions=raw_actions,
-            simulator_type=self.cfg.env.train.simulator_type,
+            simulator_type=self.cfg.env.eval.simulator_type,
             model_name=self.cfg.actor.model.model_name,
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
@@ -357,11 +357,13 @@ class EnvWorker(Worker):
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
 
         env_output = EnvOutput(
-            simulator_type=self.cfg.env.train.simulator_type,
+            simulator_type=self.cfg.env.eval.simulator_type,
             obs=extracted_obs,
             final_obs=infos["final_observation"]
             if "final_observation" in infos
             else None,
+            # Track success terminations for eval early-stop logic.
+            dones=chunk_terminations,
         )
         return env_output, env_info
 
@@ -433,6 +435,7 @@ class EnvWorker(Worker):
             simulator.start_simulator()
 
         env_metrics = defaultdict(list)
+        real_env_interactions = 0
         for epoch in range(self.cfg.algorithm.rollout_epoch):
             env_output_list = []
             if not self.cfg.env.train.auto_reset:
@@ -504,6 +507,9 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_interact_step(
                         raw_chunk_actions, stage_id
                     )
+                    real_env_interactions += int(
+                        raw_chunk_actions.shape[0] * raw_chunk_actions.shape[1]
+                    )
                     self.send_env_batch(env_output.to_dict())
                     env_output_list[stage_id] = env_output
                     for key, value in env_info.items():
@@ -527,14 +533,19 @@ class EnvWorker(Worker):
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+        env_metrics["__real_env_interactions__"] = torch.tensor(
+            [real_env_interactions], dtype=torch.float32
+        )
 
         return env_metrics
 
     def evaluate(self):
+        eval_last_obs_list = []
         for i in range(self.stage_num):
             self.eval_simulator_list[i].start_simulator()
             self.eval_simulator_list[i].is_start = True
             extracted_obs, _, _, _, infos = self.eval_simulator_list[i].step()
+            eval_last_obs_list.append(extracted_obs)
             env_output = EnvOutput(
                 simulator_type=self.cfg.env.eval.simulator_type,
                 obs=extracted_obs,
@@ -545,11 +556,35 @@ class EnvWorker(Worker):
             self.send_env_batch(env_output.to_dict(), mode="eval")
 
         eval_metrics = defaultdict(list)
+        eval_success_once_masks = [
+            torch.zeros(self.cfg.env.eval.num_envs, dtype=torch.bool)
+            for _ in range(self.stage_num)
+        ]
+        eval_stage_finished = [False for _ in range(self.stage_num)]
 
         for eval_step in range(self.cfg.algorithm.n_eval_chunk_steps):
             for i in range(self.stage_num):
                 raw_chunk_actions = self.recv_chunk_actions()
-                env_output, env_info = self.env_evaluate_step(raw_chunk_actions, i)
+                if eval_stage_finished[i]:
+                    # Keep rollout/env message counts aligned while skipping extra env steps.
+                    env_output = EnvOutput(
+                        simulator_type=self.cfg.env.eval.simulator_type,
+                        obs=eval_last_obs_list[i],
+                    )
+                    env_info = {}
+                else:
+                    env_output, env_info = self.env_evaluate_step(raw_chunk_actions, i)
+                    eval_last_obs_list[i] = env_output.obs
+                    if env_output.dones is not None:
+                        success_once = env_output.dones
+                        if success_once.ndim > 1:
+                            success_once = success_once.any(dim=1)
+                        eval_success_once_masks[i] = torch.logical_or(
+                            eval_success_once_masks[i], success_once.bool().cpu()
+                        )
+                        eval_stage_finished[i] = bool(
+                            eval_success_once_masks[i].all().item()
+                        )
 
                 for key, value in env_info.items():
                     eval_metrics[key].append(value)

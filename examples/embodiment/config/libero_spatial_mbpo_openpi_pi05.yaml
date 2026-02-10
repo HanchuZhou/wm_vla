@@ -35,7 +35,7 @@ runner:
 
   val_check_interval: 2
   save_eval_and_val_gif: true
-  num_gif_every_steps: 3
+  num_gif_every_steps: 1
   real_rollout_every_steps: -1
   save_interval: -1 # for checkpoint saving, not for gif saving
   seq_length: 4096

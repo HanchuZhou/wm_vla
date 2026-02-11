@@ -82,6 +82,10 @@ start_mbpo: 5
 world_model:
   enable: true
   device: cuda:0
+  # Optional generation devices for imagined rollout.
+  # If null, generation runs only on `world_model.device`.
+  # Example override: `world_model.gen_devices=[cuda:0,cuda:1,cuda:2]`
+  gen_devices: null
   channel:
     name: "wm_buffer"
     queue_name: "wm_step_buffer"

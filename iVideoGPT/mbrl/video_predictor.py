@@ -298,7 +298,14 @@ class VideoPredictor(nn.Module):
         }
 
     @torch.no_grad()
-    def rollout(self, obs, policy, horizon, do_sample=True):
+    def rollout(
+        self,
+        obs,
+        policy,
+        horizon,
+        do_sample=True,
+        progress_callback=None,
+    ):
         args = self.args
         force_fp32 = getattr(args, "rollout_force_fp32", False)
         log_stats = getattr(args, "rollout_log_stats", False)
@@ -398,6 +405,13 @@ class VideoPredictor(nn.Module):
                 obss.append(obs)
                 actions.append(action)
                 rewards.append(reward)
+
+                if progress_callback is not None:
+                    try:
+                        progress_callback()
+                    except Exception:
+                        # Progress callbacks must never affect rollout execution.
+                        pass
 
         # dummy step
         obss = [init_obs] + obss

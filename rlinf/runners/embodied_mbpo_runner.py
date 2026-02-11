@@ -245,6 +245,9 @@ class EmbodiedMBPORunner:
 
     def run(self):
         start_step = self.global_step
+        wm_gen_total_duration = 0.0
+        wm_gen_total_calls = 0
+
         if self.world_model is not None and not self.world_model.init_model:
             print("[stage] world model demo finetuning start")
             t0 = time.perf_counter()
@@ -408,6 +411,8 @@ class EmbodiedMBPORunner:
                                     self.metric_logger.log(
                                         {"time/wm_gen": duration}, self.global_step
                                     )
+                                    wm_gen_total_duration += duration
+                                    wm_gen_total_calls += 1
                                     if imagined is not None:
                                         self.actor.append_rollout_batch(imagined).wait()
                                 self.world_model.init_gen = True
@@ -432,6 +437,8 @@ class EmbodiedMBPORunner:
                                 self.metric_logger.log(
                                     {"time/wm_gen": duration}, self.global_step
                                 )
+                                wm_gen_total_duration += duration
+                                wm_gen_total_calls += 1
                                 if imagined is not None:
                                     self.actor.append_rollout_batch(imagined).wait()
 
@@ -509,6 +516,15 @@ class EmbodiedMBPORunner:
             global_pbar.set_postfix(logging_metrics)
             global_pbar.update(1)
 
+        if wm_gen_total_calls > 0:
+            print(
+                "[stage] world model generation total "
+                f"calls={wm_gen_total_calls} "
+                f"duration={wm_gen_total_duration:.2f}s "
+                f"avg={wm_gen_total_duration / wm_gen_total_calls:.2f}s"
+            )
+        elif self.world_model is not None:
+            print("[stage] world model generation total calls=0 duration=0.00s")
         self.metric_logger.finish()
 
     def _save_checkpoint(self):

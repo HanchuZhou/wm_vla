@@ -1,5 +1,7 @@
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +40,13 @@ class _SimpleTimeStep:
         if isinstance(attr, str):
             return getattr(self, attr)
         return tuple.__getitem__(self, attr)
+
+
+@dataclass
+class _GenerationContext:
+    device: str
+    video_predictor: VideoPredictor
+    policy_model: Any
 
 
 class WorldModelMBPO:
@@ -80,6 +89,7 @@ class WorldModelMBPO:
         self._setup_replay_buffers()
         self._setup_world_model()
         self._setup_policy_model()
+        self._setup_generation_contexts()
 
     def _setup_replay_buffers(self) -> None:
         obs_spec = specs.BoundedArray(
@@ -148,9 +158,99 @@ class WorldModelMBPO:
         self.policy_model.eval()
         self.policy_model.to(self.device)
 
+    def _resolve_generation_devices(self) -> list[str]:
+        configured = getattr(self.cfg.world_model, "gen_devices", None)
+        if configured is None:
+            return [self.device]
+
+        if isinstance(configured, str):
+            raw_items = [item.strip() for item in configured.split(",") if item.strip()]
+        elif isinstance(configured, Iterable):
+            raw_items = list(configured)
+        else:
+            raw_items = [configured]
+
+        devices: list[str] = []
+        for item in raw_items:
+            if isinstance(item, int):
+                device = f"cuda:{item}"
+            else:
+                device = str(item).strip()
+            if device == "":
+                continue
+            if device not in devices:
+                devices.append(device)
+
+        if not devices:
+            devices = [self.device]
+        if self.device in devices:
+            devices.remove(self.device)
+        devices.insert(0, self.device)
+        return devices
+
+    def _setup_generation_contexts(self) -> None:
+        self._generation_devices = self._resolve_generation_devices()
+        self._generation_contexts: list[_GenerationContext] = [
+            _GenerationContext(
+                device=self.device,
+                video_predictor=self.video_predictor,
+                policy_model=self.policy_model,
+            )
+        ]
+        # Replica models are lazily initialized when multi-GPU generation is first used.
+        self._generation_replicas_stale = False
+
+    def _build_generation_context(self, device: str) -> _GenerationContext:
+        print(f"[wm] initializing generation replica on {device}")
+        video_predictor = VideoPredictor(device, self.cfg.world_model)
+        policy_model = get_model(
+            self.cfg.actor.checkpoint_load_path,
+            self.cfg.actor.model,
+        )
+        policy_model.eval()
+        policy_model.to(device)
+        return _GenerationContext(
+            device=device,
+            video_predictor=video_predictor,
+            policy_model=policy_model,
+        )
+
+    def _ensure_generation_contexts(self) -> list[_GenerationContext]:
+        if len(self._generation_devices) <= 1:
+            return self._generation_contexts
+        while len(self._generation_contexts) < len(self._generation_devices):
+            next_device = self._generation_devices[len(self._generation_contexts)]
+            self._generation_contexts.append(self._build_generation_context(next_device))
+            self._generation_replicas_stale = True
+        return self._generation_contexts
+
+    def _mark_generation_replicas_stale(self) -> None:
+        if len(self._generation_devices) > 1:
+            self._generation_replicas_stale = True
+
+    def _sync_generation_replicas_if_needed(self) -> None:
+        if len(self._generation_devices) <= 1:
+            return
+        self._ensure_generation_contexts()
+        if not self._generation_replicas_stale:
+            return
+
+        primary = self._generation_contexts[0]
+        model_state = primary.video_predictor.model.state_dict()
+        tokenizer_state = primary.video_predictor.tokenizer.state_dict()
+        policy_state = primary.policy_model.state_dict()
+
+        for context in self._generation_contexts[1:]:
+            context.video_predictor.model.load_state_dict(model_state, strict=True)
+            context.video_predictor.tokenizer.load_state_dict(tokenizer_state, strict=True)
+            context.policy_model.load_state_dict(policy_state, strict=True)
+            context.policy_model.eval()
+        self._generation_replicas_stale = False
+
     def load_policy_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.policy_model.load_state_dict(state_dict)
         self.policy_model.eval()
+        self._mark_generation_replicas_stale()
 
     def _global_env_index(self, env_rank: int, stage_id: int, env_idx: int) -> int:
         return (
@@ -355,17 +455,26 @@ class WorldModelMBPO:
             env_obs["wrist_images"] = image.cpu()
         return env_obs
 
-    def _policy_predict(self, obs: torch.Tensor, task_descs: list[str]):
+    def _policy_predict_with_model(
+        self,
+        policy_model,
+        obs: torch.Tensor,
+        task_descs: list[str],
+    ):
         env_obs = self._prepare_env_obs(obs, task_descs)
         with torch.no_grad():
-            actions, result = self.policy_model.predict_action_batch(
+            actions, result = policy_model.predict_action_batch(
                 env_obs=env_obs,
                 mode="train",
             )
         return actions, result
 
+    def _policy_predict(self, obs: torch.Tensor, task_descs: list[str]):
+        return self._policy_predict_with_model(self.policy_model, obs, task_descs)
+
     def maybe_update_world_model(self, env_steps: int) -> dict[str, float]:
         metrics = {}
+        updated = False
         if env_steps < self.cfg.num_seed_frames:
             return metrics
 
@@ -386,8 +495,11 @@ class WorldModelMBPO:
                     self.cfg.world_model, "seed_update_tokenizer", True
                 )
                 metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
+                updated = True
             self.video_predictor.save_snapshot(self.work_dir, suffix="_init")
             self.init_model = True
+            if updated:
+                self._mark_generation_replicas_stale()
             return {f"wm_init/{k}": v for k, v in metrics.items()}
 
         if self.cfg.update_gen_every_step > 0 and env_steps % self.cfg.update_gen_every_step == 0:
@@ -409,28 +521,37 @@ class WorldModelMBPO:
                     == 0
                 )
                 metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
+                updated = True
+            if updated:
+                self._mark_generation_replicas_stale()
             return {f"wm/{k}": v for k, v in metrics.items()}
 
         return metrics
 
-    def generate_imagined_rollout(self, chunk_steps: int) -> Optional[dict[str, torch.Tensor]]:
-        if self.replay_storage._num_episodes == 0 and not self._has_demo:
-            return None
-        batch = next(self._get_replay_iter())
-        obs = batch[0][: self.cfg.gen_batch]
-        obs = torch.as_tensor(obs, device=self.device)
+    def _generate_imagined_rollout_on_context(
+        self,
+        context: _GenerationContext,
+        obs: torch.Tensor,
+        task_descs: list[str],
+        chunk_steps: int,
+        progress_callback=None,
+    ) -> dict[str, torch.Tensor]:
+        obs = torch.as_tensor(obs, device=context.device)
         horizon = chunk_steps * self.num_action_chunks
         rollout_result = EmbodiedRolloutResult()
         actions_cache: Optional[torch.Tensor] = None
         cache_index = 0
-        task_descs = self._sample_task_descriptions(obs.shape[0])
 
         def policy(step_obs: torch.Tensor, step_idx: int):
             nonlocal actions_cache, cache_index
             if step_idx % self.num_action_chunks == 0:
-                actions, result = self._policy_predict(step_obs, task_descs)
+                actions, result = self._policy_predict_with_model(
+                    context.policy_model,
+                    step_obs,
+                    task_descs,
+                )
                 actions_cache = torch.as_tensor(
-                    actions, device=self.device, dtype=torch.float32
+                    actions, device=context.device, dtype=torch.float32
                 )
                 cache_index = 0
                 rollout_result.append_result(result)
@@ -438,14 +559,19 @@ class WorldModelMBPO:
             cache_index += 1
             return action
 
-        obss, _actions, rewards = self.video_predictor.rollout(
+        obss, _actions, rewards = context.video_predictor.rollout(
             obs,
             policy,
             horizon,
             do_sample=getattr(self.cfg.world_model, "rollout_do_sample", True),
+            progress_callback=progress_callback,
         )
         if obss is not None and obss.shape[1] > 0:
-            _, final_result = self._policy_predict(obss[:, -1], task_descs)
+            _, final_result = self._policy_predict_with_model(
+                context.policy_model,
+                obss[:, -1],
+                task_descs,
+            )
             if "prev_values" in final_result:
                 rollout_result.prev_values.append(
                     final_result["prev_values"].cpu().contiguous()
@@ -467,6 +593,169 @@ class WorldModelMBPO:
         rollout_batch["rewards"] = rewards.cpu().contiguous()
         rollout_batch["dones"] = dones.cpu().contiguous()
         return rollout_batch
+
+    @staticmethod
+    def _merge_imagined_rollout_batches(
+        rollout_batches: list[dict[str, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        merged: dict[str, torch.Tensor] = {}
+        keys = set()
+        for batch in rollout_batches:
+            keys.update(batch.keys())
+        for key in keys:
+            values = [batch.get(key) for batch in rollout_batches]
+            values = [value for value in values if value is not None]
+            if not values:
+                merged[key] = None
+                continue
+            if isinstance(values[0], torch.Tensor):
+                merged[key] = torch.cat(values, dim=1).contiguous()
+            else:
+                raise ValueError(
+                    f"Unsupported rollout batch value type for key={key}: {type(values[0])}"
+                )
+        return merged
+
+    def generate_imagined_rollout(self, chunk_steps: int) -> Optional[dict[str, torch.Tensor]]:
+        if self.replay_storage._num_episodes == 0 and not self._has_demo:
+            return None
+
+        contexts = self._ensure_generation_contexts()
+        self._sync_generation_replicas_if_needed()
+
+        batch = next(self._get_replay_iter())
+        obs_cpu = torch.as_tensor(batch[0][: self.cfg.gen_batch])
+        total_batch = int(obs_cpu.shape[0])
+        if total_batch == 0:
+            return None
+        task_descs = self._sample_task_descriptions(total_batch)
+        show_progress = bool(getattr(self.cfg.world_model, "gen_show_progress", True))
+
+        active_contexts = contexts[: min(len(contexts), total_batch)]
+        if len(active_contexts) == 1:
+            single_progress_cb = None
+            if show_progress:
+                horizon = chunk_steps * self.num_action_chunks
+                if horizon > 0:
+                    total_units = int(total_batch * horizon)
+                    pbar = tqdm(
+                        total=total_units,
+                        desc="WM Gen",
+                        ncols=120,
+                        leave=False,
+                    )
+                    step_units = int(total_batch)
+
+                    def _update_pbar(delta_units: int):
+                        remaining = max(0, total_units - int(pbar.n))
+                        inc = min(delta_units, remaining)
+                        if inc > 0:
+                            pbar.update(inc)
+                        sample_equiv = (float(pbar.n) / float(horizon))
+                        pbar.set_postfix(
+                            {"samples": f"{sample_equiv:.1f}/{float(total_batch):.1f}"}
+                        )
+
+                    def single_progress_cb():
+                        _update_pbar(step_units)
+                else:
+                    pbar = None
+            else:
+                pbar = None
+            rollout_batch = self._generate_imagined_rollout_on_context(
+                active_contexts[0],
+                obs_cpu,
+                task_descs,
+                chunk_steps,
+                progress_callback=single_progress_cb,
+            )
+            if pbar is not None:
+                total_units = int(total_batch * horizon)
+                if int(pbar.n) < total_units:
+                    pbar.update(total_units - int(pbar.n))
+                pbar.set_postfix({"samples": f"{float(total_batch):.1f}/{float(total_batch):.1f}"})
+                pbar.close()
+            return rollout_batch
+
+        num_shards = len(active_contexts)
+        shard_sizes = [total_batch // num_shards for _ in range(num_shards)]
+        for i in range(total_batch % num_shards):
+            shard_sizes[i] += 1
+
+        starts = [0]
+        for size in shard_sizes[:-1]:
+            starts.append(starts[-1] + size)
+
+        rollout_batches_by_shard: list[Optional[dict[str, torch.Tensor]]] = [None] * num_shards
+        horizon = chunk_steps * self.num_action_chunks
+        pbar = None
+        total_units = None
+        if show_progress:
+            total_units = int(total_batch * max(1, horizon))
+            pbar = tqdm(
+                total=total_units,
+                desc=f"WM Gen ({num_shards} GPU)",
+                ncols=120,
+                leave=False,
+            )
+        pbar_lock = threading.Lock()
+
+        def _safe_update_pbar(delta_units: int):
+            if pbar is None:
+                return
+            with pbar_lock:
+                remaining = max(0, int(total_units) - int(pbar.n))
+                inc = min(delta_units, remaining)
+                if inc > 0:
+                    pbar.update(inc)
+                horizon_denom = max(1, horizon)
+                sample_equiv = float(pbar.n) / float(horizon_denom)
+                pbar.set_postfix(
+                    {"samples": f"{sample_equiv:.1f}/{float(total_batch):.1f}"}
+                )
+
+        try:
+            with ThreadPoolExecutor(max_workers=num_shards) as executor:
+                future_to_meta = {}
+                for shard_idx, context in enumerate(active_contexts):
+                    start = starts[shard_idx]
+                    end = start + shard_sizes[shard_idx]
+                    obs_shard = obs_cpu[start:end]
+                    task_shard = task_descs[start:end]
+                    shard_size = shard_sizes[shard_idx]
+                    shard_step_units = int(shard_size)
+
+                    def _make_progress_cb(delta_units: int):
+                        if pbar is None:
+                            return None
+
+                        def _progress_cb():
+                            _safe_update_pbar(delta_units)
+
+                        return _progress_cb
+
+                    shard_progress_cb = _make_progress_cb(shard_step_units)
+                    future = executor.submit(
+                        self._generate_imagined_rollout_on_context,
+                        context,
+                        obs_shard,
+                        task_shard,
+                        chunk_steps,
+                        shard_progress_cb,
+                    )
+                    future_to_meta[future] = (shard_idx, shard_size)
+                for future in as_completed(future_to_meta):
+                    shard_idx, shard_size = future_to_meta[future]
+                    rollout_batches_by_shard[shard_idx] = future.result()
+        finally:
+            if pbar is not None:
+                if int(pbar.n) < int(total_units):
+                    pbar.update(int(total_units) - int(pbar.n))
+                pbar.set_postfix({"samples": f"{float(total_batch):.1f}/{float(total_batch):.1f}"})
+                pbar.close()
+
+        rollout_batches = [batch for batch in rollout_batches_by_shard if batch is not None]
+        return self._merge_imagined_rollout_batches(rollout_batches)
 
     def validate(
         self,

@@ -61,17 +61,39 @@ To reproduce the WM_VLA run used here:
   ```bash
     huggingface-cli download HanchuZhou/wm-rl-vla-sif
   ```
-6. Execute inside the SIF (single GPU example):  
+6. For A100 cluster, load the docker: 
   ```bash
-    /usr/bin/singularity exec --nv \
-    --bind /mnt/workspace/hanchu/nvidia-egl:/opt/nvidia-egl \
-    /mnt/workspace/hanchu/wm_rl_vla.sif env \
-    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+    bash --login
+    module load singularity	
+    unset LD_PRELOAD
+    singularity shell --nv ~/rlinf_agentic.sif
+  ```
+  Then in the env, run:
+  ```bash
+    env MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
     TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1 \
     MBPO_GPU=0 VLA_GPUS=1,2,3 \
     MBPO_DEMO=true \
     MBPO_EXTRA_ARGS="num_seed_frames=0 init_update_gen_steps=200 start_mbpo=0 init_gen_times=20 gen_every_steps=1 gen_batch=24 update_gen_times=1 world_model.batch_size=4 update_gen_every_step=2 +world_model.sync_every_steps=2" \
     VLA_EXTRA_ARGS="runner.max_epochs=50 runner.val_check_interval=2 algorithm.num_group_envs=12 algorithm.rollout_epoch=4 actor.micro_batch_size=4 actor.global_batch_size=24 +rollout.sync_every_steps=1 env.eval.num_envs=6" \
+    bash /mnt/workspace/hanchu/wm_vla/examples/embodiment/run_wm_rl_vla_libero_spatial_mbpo_openpi_pi05_embodied.sh
+  ```
+
+  For H200 cluster, load the docker:
+  ```bash
+    export SINGULARITY_TMPDIR=/mnt/workspace/hanchu/.singularity-tmp
+    export SINGULARITY_CACHEDIR=/mnt/workspace/hanchu/.singularity-cache
+    /usr/bin/singularity shell --userns --nv \
+      --bind /mnt/workspace/hanchu/nvidia-egl:/opt/nvidia-egl \
+      /mnt/workspace/hanchu/wm_rl_vla.sif
+  ```
+  Then in the env, run:
+  ```bash
+    env MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+    TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1 \
+    MBPO_GPU=4 VLA_GPUS=5,6,7 MBPO_DEMO=true \
+    MBPO_EXTRA_ARGS="num_seed_frames=5 init_update_gen_steps=2000 start_mbpo=6 init_gen_times=1 gen_every_steps=1 gen_batch=12 update_gen_times=2 world_model.batch_size=8 update_gen_every_step=10 num_eval_episodes=100 +world_model.sync_every_steps=10 replay_buffer_num_workers=4" \
+    VLA_EXTRA_ARGS="runner.max_epochs=100 runner.val_check_interval=2 algorithm.rollout_epoch=1 algorithm.num_group_envs=128 actor.micro_batch_size=256 actor.global_batch_size=1536 +rollout.sync_every_steps=1 env.eval.num_envs=30" \
     bash /mnt/workspace/hanchu/wm_vla/examples/embodiment/run_wm_rl_vla_libero_spatial_mbpo_openpi_pi05_embodied.sh
   ```
 

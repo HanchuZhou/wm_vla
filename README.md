@@ -29,6 +29,13 @@ RLinf is a flexible and scalable open-source infrastructure designed for post-tr
 </div>
 
 ## WM_VLA !!!!
+todo: 
+1. eval=200
+2. eval fsp higher
+3. easy rename run
+4. wm make sure it will not updated if frozen
+4. wm make sure the training, generation and validation are in the same episode
+5. wm eval metric
 
 To reproduce the WM_VLA run used here:
 1. **Download LIBERO demos** (official release):
@@ -48,7 +55,9 @@ To reproduce the WM_VLA run used here:
    ```
 3. Download the pretrained VGM from:
   ```bash
-    huggingface-cli download thuml/ivideogpt-oxe-64-act-free --local-dir iVideoGPT/pretrained_models
+    hf download thuml/ivideogpt-oxe-64-act-free --local-dir iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free
+    hf download thuml/ivideogpt-oxe-64-act-free-medium --local-dir iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free-medium
+    hf download thuml/ivideogpt-oxe-256-act-free --local-dir iVideoGPT/pretrained_models/ivideogpt-oxe-256-act-free
   ```
 4. Download the VLA:
   ```bash

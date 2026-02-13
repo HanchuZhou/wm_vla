@@ -39,6 +39,29 @@ def load_episode(fn):
         return episode
 
 
+def maybe_resize_observation(obs, image_size):
+    if image_size is None:
+        return obs
+    target = int(image_size)
+    if obs.shape[-2] == target and obs.shape[-1] == target:
+        return obs
+
+    squeeze_batch = False
+    obs_tensor = torch.from_numpy(obs.astype(np.float32, copy=False))
+    if obs_tensor.ndim == 3:
+        obs_tensor = obs_tensor.unsqueeze(0)
+        squeeze_batch = True
+    resized = nn.functional.interpolate(
+        obs_tensor, size=(target, target), mode='bilinear', align_corners=False
+    )
+    if squeeze_batch:
+        resized = resized.squeeze(0)
+
+    if obs.dtype == np.uint8:
+        return resized.clamp(0.0, 255.0).round().to(torch.uint8).cpu().numpy()
+    return resized.cpu().numpy().astype(obs.dtype, copy=False)
+
+
 class ReplayBufferStorage:
     def __init__(self, data_specs, replay_dir):
         self._data_specs = data_specs
@@ -87,7 +110,7 @@ class ReplayBufferStorage:
 
 class ReplayBuffer(IterableDataset):
     def __init__(self, replay_dir, max_size, num_workers, nstep, discount,
-                 fetch_every, save_snapshot, demo_path=None):
+                 fetch_every, save_snapshot, demo_path=None, demo_image_size=None):
         self._replay_dir = replay_dir
         self._size = 0
         self._max_size = max_size
@@ -101,6 +124,9 @@ class ReplayBuffer(IterableDataset):
         self._save_snapshot = save_snapshot
 
         self._num_direct_episodes = 0
+        self._demo_image_size = (
+            int(demo_image_size) if demo_image_size is not None else None
+        )
 
         if demo_path is not None:
             files = glob.glob(os.path.join(demo_path, '*.npz'))
@@ -194,6 +220,8 @@ class ReplayBuffer(IterableDataset):
         obs = episode['observation'][idx - 1]
         action = episode['action'][idx]
         next_obs = episode['observation'][idx + self._nstep - 1]
+        obs = maybe_resize_observation(obs, self._demo_image_size)
+        next_obs = maybe_resize_observation(next_obs, self._demo_image_size)
         reward = np.zeros_like(episode['reward'][idx])
         discount = np.ones_like(episode['discount'][idx])
         for i in range(self._nstep):
@@ -209,9 +237,9 @@ class ReplayBuffer(IterableDataset):
 
 class ReplaySegmentBuffer(ReplayBuffer):
     def __init__(self, replay_dir, max_size, num_workers, nstep, discount,
-                 fetch_every, save_snapshot, segment_length, demo_path=None):
+                 fetch_every, save_snapshot, segment_length, demo_path=None, demo_image_size=None):
         super().__init__(replay_dir, max_size, num_workers, nstep, discount,
-                         fetch_every, save_snapshot, demo_path)
+                         fetch_every, save_snapshot, demo_path, demo_image_size)
         self._segment_length = segment_length
 
     def _sample(self):
@@ -228,6 +256,7 @@ class ReplaySegmentBuffer(ReplayBuffer):
         # ensure the upper bound accounts for inclusive end index
         idx = np.random.randint(1, length - self._segment_length + 1)
         obs = episode['observation'][idx - 1: idx + self._segment_length - 1, -3:]
+        obs = maybe_resize_observation(obs, self._demo_image_size)
         action = episode['action'][idx: idx + self._segment_length]
         reward = episode['reward'][idx: idx + self._segment_length]
         return (obs, action, reward)
@@ -246,7 +275,7 @@ def _worker_init_fn(worker_id):
 
 
 def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
-                       save_snapshot, nstep, discount, demo_path=None):
+                       save_snapshot, nstep, discount, demo_path=None, demo_image_size=None):
     max_size_per_worker = max_size // max(1, num_workers)
 
     iterable = ReplayBuffer(replay_dir,
@@ -256,7 +285,8 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
                             discount,
                             fetch_every=1000,
                             save_snapshot=save_snapshot,
-                            demo_path=demo_path)
+                            demo_path=demo_path,
+                            demo_image_size=demo_image_size)
 
     loader = torch.utils.data.DataLoader(iterable,
                                          batch_size=batch_size,
@@ -267,7 +297,7 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
 
 
 def make_segment_replay_loader(replay_dir, max_size, batch_size, num_workers,
-                               save_snapshot, nstep, discount, segment_length, demo_path=None):
+                               save_snapshot, nstep, discount, segment_length, demo_path=None, demo_image_size=None):
     max_size_per_worker = max_size // max(1, num_workers)
 
     iterable = ReplaySegmentBuffer(replay_dir,
@@ -278,7 +308,8 @@ def make_segment_replay_loader(replay_dir, max_size, batch_size, num_workers,
                                    fetch_every=1000,
                                    save_snapshot=save_snapshot,
                                    segment_length=segment_length,
-                                   demo_path=demo_path)
+                                   demo_path=demo_path,
+                                   demo_image_size=demo_image_size)
 
     loader = torch.utils.data.DataLoader(iterable,
                                          batch_size=batch_size,

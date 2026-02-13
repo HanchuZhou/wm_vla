@@ -131,6 +131,7 @@ class WorldModelMBPO:
             self.cfg.nstep,
             self.cfg.discount,
             demo_path,
+            demo_image_size=self.image_size,
         )
         self._replay_iter = None
 
@@ -144,6 +145,7 @@ class WorldModelMBPO:
             self.cfg.discount,
             self.cfg.gen_horizon + self.cfg.world_model.context_length,
             demo_path,
+            demo_image_size=self.image_size,
         )
         self._seg_replay_iter = None
 

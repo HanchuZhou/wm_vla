@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - pretrained_vgm: 64_small
   - override hydra/launcher: submitit_local
 
 name: "0"
@@ -26,7 +27,6 @@ demo: true
 
 seed: 1
 device: cuda
-image_size: 64
 save_video: true
 save_train_video: false
 use_tb: ${oc.env:USE_TB,false}
@@ -81,10 +81,7 @@ world_model:
   rollout_do_sample: true
   rollout_force_fp32: true
   rollout_log_stats: true
-  config_name: ${repo_root}/iVideoGPT/configs/llama/config.json
   vqgan_type: ctx_vqgan
-  pretrained_model_name_or_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/tokenizer
-  pretrained_transformer_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/transformer
   load_internal_llm: true
   llama_attn_drop: 0.1
   fast_reward_predictor: false

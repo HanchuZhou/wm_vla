@@ -1,0 +1,8 @@
+# @package _global_
+pretrained_vgm: 64_small
+image_size: 64
+
+world_model:
+  config_name: ${repo_root}/iVideoGPT/configs/llama/config.json
+  pretrained_model_name_or_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/tokenizer
+  pretrained_transformer_path: ${repo_root}/iVideoGPT/pretrained_models/ivideogpt-oxe-64-act-free/transformer

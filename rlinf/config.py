@@ -649,10 +649,22 @@ def validate_embodied_cfg(cfg):
     )
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
+    actor_world_size = component_placement.get_world_size("actor")
     cfg.algorithm.num_group_envs = (
         cfg.algorithm.num_group_envs // stage_num // env_world_size
     )
     cfg.env.eval.num_envs = cfg.env.eval.num_envs // stage_num // env_world_size
+
+    if cfg.actor.training_backend == "fsdp":
+        micro_batch_size = int(cfg.actor.micro_batch_size)
+        global_batch_size = int(cfg.actor.global_batch_size)
+        denominator = micro_batch_size * actor_world_size
+        if denominator <= 0 or global_batch_size % denominator != 0:
+            raise SystemExit(
+                "[config error] actor.global_batch_size must be divisible by "
+                "actor.micro_batch_size * actor_world_size: "
+                f"{global_batch_size} % ({micro_batch_size} * {actor_world_size}) != 0"
+            )
 
     with open_dict(cfg):
         if cfg.env.train.simulator_type == "maniskill":

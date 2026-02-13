@@ -259,7 +259,7 @@ class EmbodiedMBPORunner:
             if wm_metrics:
                 self.metric_logger.log(wm_metrics, self.global_step)
             if not self.world_model.init_model:
-                print("[stage] world model demo finetuning skipped (no demo data)")
+                print("[stage] world model demo finetuning skipped (no demo data or seeding not complete)")
         global_pbar = tqdm(
             initial=start_step,
             total=self.max_steps,

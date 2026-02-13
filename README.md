@@ -48,7 +48,7 @@ To reproduce the WM_VLA run used here:
    ```
 3. Download the pretrained VGM from:
   ```bash
-    https://huggingface.co/thuml/ivideogpt-oxe-64-act-free
+    huggingface-cli download thuml/ivideogpt-oxe-64-act-free --local-dir iVideoGPT/pretrained_models
   ```
 4. Download the VLA:
   ```bash

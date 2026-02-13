@@ -141,6 +141,19 @@ class ReplayBuffer(IterableDataset):
                 loaded += 1
             print(f"[stage] demo preload end: loaded {loaded} episodes")
 
+    def _is_replay_file(self, eps_fn):
+        eps_path = Path(eps_fn)
+        replay_root = self._replay_dir
+        try:
+            eps_path.resolve().relative_to(replay_root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _maybe_unlink_replay_file(self, eps_fn):
+        if self._is_replay_file(eps_fn):
+            Path(eps_fn).unlink(missing_ok=True)
+
     def _sample_episode(self):
         eps_fn = random.choice(self._episode_fns)
         return self._episodes[eps_fn]
@@ -172,14 +185,14 @@ class ReplayBuffer(IterableDataset):
             early_eps_fn = self._episode_fns.pop(0)
             early_eps = self._episodes.pop(early_eps_fn)
             self._size -= episode_len(early_eps)
-            early_eps_fn.unlink(missing_ok=True)
+            self._maybe_unlink_replay_file(early_eps_fn)
         self._episode_fns.append(eps_fn)
         self._episode_fns.sort()
         self._episodes[eps_fn] = episode
         self._size += eps_len
 
         if not self._save_snapshot:
-            eps_fn.unlink(missing_ok=True)
+            self._maybe_unlink_replay_file(eps_fn)
         return True
 
     def _try_fetch(self):

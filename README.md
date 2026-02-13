@@ -51,8 +51,8 @@ To reproduce the WM_VLA run used here:
    python iVideoGPT/datasets/convert_libero_demos.py \
        --download-dir iVideoGPT/datasets/libero_raw \
        --output-dir iVideoGPT/mbrl/demonstrations \
-       --suites libero_spatial
-       --rotate_180
+       --suites libero_spatial \
+       --rotate-180
    ```
 3. Download the pretrained VGM from:
   ```bash

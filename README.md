@@ -34,8 +34,9 @@ todo:
 2. eval fsp higher
 3. easy rename run
 4. wm make sure it will not updated if frozen
-4. wm make sure the training, generation and validation are in the same episode
-5. wm eval metric
+5. wm make sure the training, generation and validation are in the same episode
+6. wm eval metric
+7. train.loss is very high
 
 To reproduce the WM_VLA run used here:
 1. **Download LIBERO demos** (official release):

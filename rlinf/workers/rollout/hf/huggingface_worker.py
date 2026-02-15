@@ -17,12 +17,15 @@ import gc
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
+from transformers.utils import logging as hf_logging
 
 from rlinf.data.io_struct import EmbodiedRolloutResult
 from rlinf.models import get_model, get_vla_model_config_and_processor
 from rlinf.scheduler import Cluster, Worker
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.placement import HybridComponentPlacement
+
+hf_logging.set_verbosity_error()
 
 
 class MultiStepRolloutWorker(Worker):
@@ -36,6 +39,7 @@ class MultiStepRolloutWorker(Worker):
 
         self._obs_queue_name = cfg.env.channel.queue_name
         self._action_queue_name = cfg.rollout.channel.queue_name
+        self._eval_metric_queue_name = f"{self._action_queue_name}_eval_metrics"
         self._replay_buffer_name = cfg.actor.channel.queue_name
         self.stage_num = cfg.rollout.pipeline_stage_num
 
@@ -180,11 +184,39 @@ class MultiStepRolloutWorker(Worker):
         if self.cfg.rollout.get("enable_offload", False):
             self.reload_model()
 
+        entropy_sum = 0.0
+        entropy_count = 0
+
         for _ in range(self.cfg.algorithm.n_eval_chunk_steps):
             for _ in range(self.stage_num):
                 env_output = self.recv_env_output()
-                actions, _ = self.predict(env_output["obs"], mode="eval")
+                actions, result = self.predict(env_output["obs"], mode="eval")
+                # Keep eval actions deterministic; for OpenPI we run one extra
+                # train-mode forward only to estimate action entropy statistics.
+                if self.cfg.actor.model.model_name == "openpi":
+                    _, entropy_result = self.predict(env_output["obs"], mode="train")
+                    prev_logprobs = entropy_result.get("prev_logprobs", None)
+                else:
+                    prev_logprobs = (
+                        result.get("prev_logprobs", None)
+                        if isinstance(result, dict)
+                        else None
+                    )
+
+                if prev_logprobs is not None and not torch.is_tensor(prev_logprobs):
+                    prev_logprobs = torch.as_tensor(prev_logprobs)
+                if prev_logprobs is not None and prev_logprobs.numel() > 0:
+                    entropy_sum += float((-prev_logprobs.float()).sum().item())
+                    entropy_count += int(prev_logprobs.numel())
                 self.send_chunk_actions(actions)
+
+        self.channel.put(
+            item={
+                "policy_action_entropy_sum": entropy_sum,
+                "policy_action_entropy_count": entropy_count,
+            },
+            key=f"{self._eval_metric_queue_name}_{self._rank}",
+        )
 
         if self.cfg.rollout.get("enable_offload", False):
             self.offload_model()

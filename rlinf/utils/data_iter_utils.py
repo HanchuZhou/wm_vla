@@ -156,7 +156,7 @@ def get_iterator_k_split(
             k for k, v in batch.items() if not isinstance(v, (torch.Tensor, list))
         ]
         if len(discard_items) > 0:
-            logging.warning(
+            logging.debug(
                 f"Only support splitting torch.Tensor and List[torch.Tensor]. Discarding the following keys from the batch: {discard_items}",
             )
 

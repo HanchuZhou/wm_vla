@@ -44,6 +44,7 @@ class EnvWorker(Worker):
 
         self._obs_queue_name = cfg.env.channel.queue_name
         self._action_queue_name = cfg.rollout.channel.queue_name
+        self._eval_metric_queue_name = f"{self._action_queue_name}_eval_metrics"
         self._replay_buffer_name = cfg.actor.channel.queue_name
 
         self._wm_enabled = bool(
@@ -595,6 +596,26 @@ class EnvWorker(Worker):
         self.finish_rollout(mode="eval")
         for i in range(self.stage_num):
             self.eval_simulator_list[i].stop_simulator()
+
+        entropy_sum = 0.0
+        entropy_count = 0
+        for gather_id in range(self.gather_num):
+            entropy_payload = self.channel.get(
+                key=f"{self._eval_metric_queue_name}_{gather_id + self._rank * self.gather_num}",
+            )
+            if not isinstance(entropy_payload, dict):
+                continue
+            entropy_sum += float(entropy_payload.get("policy_action_entropy_sum", 0.0))
+            entropy_count += int(
+                entropy_payload.get("policy_action_entropy_count", 0)
+            )
+        if entropy_count > 0:
+            eval_metrics["policy_action_entropy"].append(
+                torch.tensor(
+                    [entropy_sum / float(entropy_count)],
+                    dtype=torch.float32,
+                )
+            )
 
         for key, value in eval_metrics.items():
             eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()

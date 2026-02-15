@@ -24,6 +24,15 @@ mp.set_start_method("spawn", force=True)
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
+
+    run_name_suffix = cfg.get("run_name", None)
+    if run_name_suffix is not None:
+        run_name_suffix = str(run_name_suffix).strip().lstrip("_")
+        if run_name_suffix:
+            cfg.runner.logger.experiment_name = (
+                f"{cfg.runner.logger.experiment_name}_{run_name_suffix}"
+            )
+
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(num_nodes=cfg.cluster.num_nodes)

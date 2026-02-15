@@ -28,7 +28,7 @@ runner:
     entity: flare-robot
     team: flare-robot
     org: ucd-dare
-    experiment_name: "libero_spatial_mbpo_openpi_pi05"
+    experiment_name: "mbpo_pi05"
     logger_backends: ["tensorboard", "wandb"]
 
   max_epochs: 1000
@@ -124,6 +124,8 @@ world_model:
   reward_wd: 1e-6
   reward_weight: 1.0
   show_progress: true
+  val_metric_batches: 10
+  val_metric_max_batchsize: 16
 
 # ===== RLinf algorithm =====
 algorithm:

@@ -67,7 +67,7 @@ class Cluster:
     """A singleton class that manages the cluster resources for Ray workers."""
 
     SYS_NAME = "RLinf"
-    NAMESPACE = SYS_NAME
+    NAMESPACE = os.environ.get("RLINF_NAMESPACE", SYS_NAME)
     LOGGING_LEVEL = "INFO"
     TIMEOUT_WARN_TIME = 60000
 
@@ -144,20 +144,71 @@ class Cluster:
         if "RAY_DEDUP_LOGS" not in os.environ:
             # Default disabling deduplication of logs to ensure all logs are printed.
             ray_logging.RAY_DEDUP_LOGS = 0
-        try:
-            # First try to connect to an existing Ray cluster
-            ray.init(
-                address="auto",
-                logging_level=Cluster.LOGGING_LEVEL,
-                namespace=Cluster.NAMESPACE,
-                runtime_env={"env_vars": dict(os.environ)},
+        visible_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        local_num_gpus = None
+        if visible_gpus and visible_gpus != "-1":
+            gpu_tokens = [gpu.strip() for gpu in visible_gpus.split(",") if gpu.strip()]
+            if len(gpu_tokens) > 0:
+                local_num_gpus = len(gpu_tokens)
+        local_num_cpus = None
+        visible_cpus = os.environ.get("RAY_NUM_CPUS", "").strip()
+        if visible_cpus:
+            try:
+                parsed = int(visible_cpus)
+                if parsed > 0:
+                    local_num_cpus = parsed
+            except ValueError:
+                self._logger.warning(
+                    f"Ignoring invalid RAY_NUM_CPUS={visible_cpus}. Expected a positive integer."
+                )
+        local_object_store_memory = None
+        object_store_memory_bytes = os.environ.get("RAY_OBJECT_STORE_BYTES", "").strip()
+        if object_store_memory_bytes:
+            try:
+                parsed = int(object_store_memory_bytes)
+                if parsed > 0:
+                    local_object_store_memory = parsed
+            except ValueError:
+                self._logger.warning(
+                    f"Ignoring invalid RAY_OBJECT_STORE_BYTES={object_store_memory_bytes}. Expected a positive integer."
+                )
+        local_init_kwargs = dict(
+            logging_level=Cluster.LOGGING_LEVEL,
+            namespace=Cluster.NAMESPACE,
+            runtime_env={"env_vars": dict(os.environ)},
+        )
+        if local_num_gpus is not None:
+            self._logger.info(
+                f"Starting local Ray with num_gpus={local_num_gpus} from CUDA_VISIBLE_DEVICES={visible_gpus}"
             )
-        except ConnectionError:
-            ray.init(
-                logging_level=Cluster.LOGGING_LEVEL,
-                namespace=Cluster.NAMESPACE,
-                runtime_env={"env_vars": dict(os.environ)},
+            local_init_kwargs["num_gpus"] = local_num_gpus
+        if local_num_cpus is not None:
+            self._logger.info(f"Starting local Ray with num_cpus={local_num_cpus}")
+            local_init_kwargs["num_cpus"] = local_num_cpus
+        if local_object_store_memory is not None:
+            self._logger.info(
+                f"Starting local Ray with object_store_memory={local_object_store_memory} bytes"
             )
+            local_init_kwargs["object_store_memory"] = local_object_store_memory
+
+        ray_address = os.environ.get("RAY_ADDRESS", "auto").strip() or "auto"
+        if ray_address == "local":
+            self._logger.info("RAY_ADDRESS=local, starting isolated local Ray cluster.")
+            ray.init(**local_init_kwargs)
+        else:
+            try:
+                # First try to connect to an existing Ray cluster
+                ray.init(
+                    address=ray_address,
+                    logging_level=Cluster.LOGGING_LEVEL,
+                    namespace=Cluster.NAMESPACE,
+                    runtime_env={"env_vars": dict(os.environ)},
+                )
+            except ConnectionError:
+                self._logger.info(
+                    f"Ray address '{ray_address}' unavailable, falling back to local Ray."
+                )
+                ray.init(**local_init_kwargs)
 
         # Wait for the cluster to be ready
         while len(ray.nodes()) < self._num_nodes:
@@ -245,15 +296,35 @@ class Cluster:
             sys.stdout.flush()
             sys.stderr.flush()
 
-            alive_actors = list_actors(
-                filters=[
-                    ("STATE", "=", "ALIVE"),
-                    ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
-                ]
-            )
+            try:
+                alive_actors = list_actors(
+                    filters=[
+                        ("STATE", "=", "ALIVE"),
+                        ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
+                    ]
+                )
+            except Exception as e:
+                # Best-effort cleanup should not fail the signal handler.
+                print(
+                    f"[cluster warning] failed to list alive actors during shutdown: {e}",
+                    file=sys.stderr,
+                )
+                alive_actors = []
             for actor_state in alive_actors:
-                actor = ray.get_actor(actor_state.name)
-                ray.kill(actor, no_restart=True)
+                actor_name = getattr(actor_state, "name", None)
+                if not actor_name:
+                    # ray.get_actor only works for named actors.
+                    continue
+                try:
+                    actor = ray.get_actor(actor_name, namespace=Cluster.NAMESPACE)
+                except ValueError:
+                    # Actor may already be dead by the time we tear down.
+                    continue
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    # Best-effort cleanup only.
+                    pass
 
             if ray.is_initialized():
                 # Mimic ray's sleep before shutdown to ensure log messages are flushed

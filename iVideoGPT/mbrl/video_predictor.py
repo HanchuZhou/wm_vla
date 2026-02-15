@@ -13,6 +13,7 @@ from accelerate.utils import set_seed
 
 from safetensors.torch import load_file
 import transformers
+from transformers.utils import logging as hf_logging
 from transformers import (
     MODEL_MAPPING,
     AutoConfig,
@@ -26,6 +27,8 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from ivideogpt.vq_model import CompressiveVQModel
 from ivideogpt.transformer import HeadModelWithAction
 from ivideogpt.vq_model import LPIPS
+
+hf_logging.set_verbosity_error()
 
 
 def grad_layer_wrt_loss(loss, layer):
@@ -199,7 +202,9 @@ class VideoPredictor(nn.Module):
 
     def update_tokenizer(self, args, obs):
         autocast_enabled = not getattr(args, "train_force_fp32", False)
-        with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=torch.bfloat16):
+        with torch.amp.autocast(
+            "cuda", enabled=autocast_enabled, dtype=torch.bfloat16
+        ):
             self.tok_optimizer.zero_grad()
             with torch.no_grad():
                 B, T, C, H, W = obs.shape
@@ -258,7 +263,9 @@ class VideoPredictor(nn.Module):
 
     def update_model(self, args, obs, action, reward):
         autocast_enabled = not getattr(args, "train_force_fp32", False)
-        with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=torch.bfloat16):
+        with torch.amp.autocast(
+            "cuda", enabled=autocast_enabled, dtype=torch.bfloat16
+        ):
             self.model_optimizer.zero_grad()
             pixel_values, actions, rewards = obs.to(self.device), action.to(self.device), reward.to(self.device)
 
@@ -326,7 +333,9 @@ class VideoPredictor(nn.Module):
             )
 
         autocast_enabled = not force_fp32
-        with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=torch.bfloat16):
+        with torch.amp.autocast(
+            "cuda", enabled=autocast_enabled, dtype=torch.bfloat16
+        ):
             B = obs.shape[0]
 
             obs = obs.to(self.device)
@@ -372,18 +381,20 @@ class VideoPredictor(nn.Module):
                             f"[rollout] casting embeds from {embeds.dtype} to {model_dtype}"
                         )
                     embeds = embeds.to(model_dtype)
-                result = self.model.llm.generate(
-                    inputs_embeds=embeds,
-                    attention_mask=attention_mask,
-                    do_sample=do_sample,
-                    temperature=1.0,
-                    pad_token_id=50256,
-                    top_k=100,
-                    use_cache=True,
-                    max_new_tokens=tokens_per_dyn + 1,
-                    return_dict_in_generate=True,
-                    output_hidden_states=True,
-                )
+                gen_kwargs = {
+                    "inputs_embeds": embeds,
+                    "attention_mask": attention_mask,
+                    "do_sample": do_sample,
+                    "temperature": 1.0,
+                    "pad_token_id": 50256,
+                    "use_cache": True,
+                    "max_new_tokens": tokens_per_dyn + 1,
+                    "return_dict_in_generate": True,
+                    "output_hidden_states": True,
+                }
+                if do_sample:
+                    gen_kwargs["top_k"] = 100
+                result = self.model.llm.generate(**gen_kwargs)
 
                 predicted_token = result.sequences[:, :-1]
                 last_layer_hidden_states = result.hidden_states[-1]

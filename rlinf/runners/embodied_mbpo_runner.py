@@ -52,13 +52,72 @@ class EmbodiedMBPORunner:
         if wandb is None:
             return
         try:
+            wandb.define_metric("global_step")
+            for key_pattern in (
+                "time/*",
+                "eval/*",
+                "env/*",
+                "rollout/*",
+                "train/*",
+                "wm/*",
+                "val/*",
+            ):
+                wandb.define_metric(key_pattern, step_metric="global_step")
             wandb.define_metric("env/real_interactions")
             wandb.define_metric(
                 "eval/success_once_vs_real_env_interactions",
                 step_metric="env/real_interactions",
             )
+            wandb.define_metric("wm_init/update_step")
+            wandb.define_metric(
+                "wm_init/*",
+                step_metric="wm_init/update_step",
+            )
         except Exception:
             pass
+
+    def _log_metrics(self, data: dict[str, object], step: int) -> None:
+        if not data:
+            return
+        non_wandb_backends = [
+            name for name in self.metric_logger.logger.keys() if name != "wandb"
+        ]
+        if non_wandb_backends:
+            self.metric_logger.log(data=data, step=step, backend=non_wandb_backends)
+        wandb = self.metric_logger.logger.get("wandb", None)
+        if wandb is None:
+            return
+        payload = dict(data)
+        payload.setdefault("global_step", float(step))
+        wandb.log(payload)
+
+    def _log_wm_init_step_metrics(self, data: dict[str, float]) -> None:
+        if not data:
+            return
+        payload = dict(data)
+        wm_init_step = int(
+            max(
+                0.0,
+                self._safe_to_float(payload.get("wm_init/update_step", 0.0)),
+            )
+        )
+        non_wandb_backends = [
+            name for name in self.metric_logger.logger.keys() if name != "wandb"
+        ]
+        if non_wandb_backends:
+            backend_payload = {
+                key: value for key, value in payload.items() if key != "wm_init/update_step"
+            }
+            if backend_payload:
+                self.metric_logger.log(
+                    data=backend_payload,
+                    step=wm_init_step,
+                    backend=non_wandb_backends,
+                )
+        wandb = self.metric_logger.logger.get("wandb", None)
+        if wandb is None:
+            return
+        wandb.log(payload, commit=True)
 
     @staticmethod
     def _safe_to_float(value, default: float = 0.0) -> float:
@@ -163,13 +222,14 @@ class EmbodiedMBPORunner:
                 continue
             try:
                 payload[f"{key_prefix}_{idx}"] = wandb.Video(
-                    str(media_path), fps=fps, format=fmt
+                    str(media_path), format=fmt
                 )
             except Exception as exc:
                 print(f"[warn] failed to log media to wandb: {media_path} ({exc})")
                 continue
         if payload:
-            wandb.log(payload, step=self.global_step)
+            payload["global_step"] = float(self.global_step)
+            wandb.log(payload)
 
     def _world_model_status_metrics(
         self,
@@ -251,13 +311,20 @@ class EmbodiedMBPORunner:
         if self.world_model is not None and not self.world_model.init_model:
             print("[stage] world model demo finetuning start")
             t0 = time.perf_counter()
-            wm_metrics = self.world_model.maybe_update_world_model(self.global_step)
+            wm_metrics = self.world_model.maybe_update_world_model(
+                self.global_step,
+                init_step_logger=self._log_wm_init_step_metrics,
+            )
             t1 = time.perf_counter()
             duration = t1 - t0
             print(f"[stage] world model demo finetuning end (duration={duration:.2f}s)")
-            self.metric_logger.log({"time/wm_init": duration}, self.global_step)
+            self._log_metrics({"time/wm_init": duration}, self.global_step)
             if wm_metrics:
-                self.metric_logger.log(wm_metrics, self.global_step)
+                non_init_wm_metrics = {
+                    k: v for k, v in wm_metrics.items() if not k.startswith("wm_init/")
+                }
+                if non_init_wm_metrics:
+                    self._log_metrics(non_init_wm_metrics, self.global_step)
             if not self.world_model.init_model:
                 print("[stage] world model demo finetuning skipped (no demo data or seeding not complete)")
         global_pbar = tqdm(
@@ -283,7 +350,7 @@ class EmbodiedMBPORunner:
                             eval_metrics["eval/success_once"]
                         )
                     eval_metrics["env/real_interactions"] = self.real_env_interactions
-                    self.metric_logger.log(data=eval_metrics, step=_step)
+                    self._log_metrics(data=eval_metrics, step=_step)
                     save_eval_and_val_gif = bool(
                         self.cfg.runner.get("save_eval_and_val_gif", True)
                     )
@@ -298,14 +365,20 @@ class EmbodiedMBPORunner:
                                 num_gifs,
                                 fps=eval_fps,
                             )
-                        if self.world_model is not None:
-                            wm_val_metrics = self.world_model.validate(
-                                global_step=self.global_step,
-                                num_gifs=num_gifs,
-                                fps=4,
-                            )
-                            if wm_val_metrics:
-                                self.metric_logger.log(wm_val_metrics, step=_step)
+                    if self.world_model is not None:
+                        num_metric_batches = int(
+                            self.cfg.world_model.get("val_metric_batches", 1)
+                        )
+                        wm_num_gifs = num_gifs if save_eval_and_val_gif else 0
+                        wm_val_metrics = self.world_model.validate(
+                            global_step=self.global_step,
+                            num_gifs=wm_num_gifs,
+                            fps=4,
+                            num_metric_batches=num_metric_batches,
+                        )
+                        if wm_val_metrics:
+                            self._log_metrics(wm_val_metrics, step=_step)
+                        if save_eval_and_val_gif and num_gifs > 0:
                             self._log_wandb_gifs(
                                 self.world_model.work_dir / "validate_gif",
                                 "validate/gif",
@@ -327,7 +400,7 @@ class EmbodiedMBPORunner:
                         f"[stage] real rollout end step={self.global_step} "
                         f"(duration={duration:.2f}s)"
                     )
-                    self.metric_logger.log(
+                    self._log_metrics(
                         {"time/real_rollout": duration}, self.global_step
                     )
                     drained = float(self._drain_wm_channel())
@@ -367,7 +440,10 @@ class EmbodiedMBPORunner:
                             )
                         wm_update_t0 = time.perf_counter()
                         wm_metrics.update(
-                            self.world_model.maybe_update_world_model(wm_step)
+                            self.world_model.maybe_update_world_model(
+                                wm_step,
+                                init_step_logger=self._log_wm_init_step_metrics,
+                            )
                         )
                         wm_update_t1 = time.perf_counter()
                         if wm_metrics:
@@ -377,7 +453,7 @@ class EmbodiedMBPORunner:
                                     "[stage] world model demo finetuning end "
                                     f"(duration={update_duration:.2f}s)"
                                 )
-                                self.metric_logger.log(
+                                self._log_metrics(
                                     {"time/wm_init": update_duration},
                                     self.global_step,
                                 )
@@ -386,7 +462,7 @@ class EmbodiedMBPORunner:
                                     "[stage] world model update end "
                                     f"(duration={update_duration:.2f}s)"
                                 )
-                                self.metric_logger.log(
+                                self._log_metrics(
                                     {"time/wm_update": update_duration},
                                     self.global_step,
                                 )
@@ -408,7 +484,7 @@ class EmbodiedMBPORunner:
                                         "[stage] world model generation end "
                                         f"(duration={duration:.2f}s)"
                                     )
-                                    self.metric_logger.log(
+                                    self._log_metrics(
                                         {"time/wm_gen": duration}, self.global_step
                                     )
                                     wm_gen_total_duration += duration
@@ -434,7 +510,7 @@ class EmbodiedMBPORunner:
                                     "[stage] world model generation end "
                                     f"(duration={duration:.2f}s)"
                                 )
-                                self.metric_logger.log(
+                                self._log_metrics(
                                     {"time/wm_gen": duration}, self.global_step
                                 )
                                 wm_gen_total_duration += duration
@@ -491,15 +567,19 @@ class EmbodiedMBPORunner:
             training_metrics = {
                 f"train/{k}": v for k, v in actor_training_metrics[0].items()
             }
-            self.metric_logger.log(env_metrics, _step)
-            self.metric_logger.log(rollout_metrics, _step)
-            self.metric_logger.log(time_metrics, _step)
-            self.metric_logger.log(training_metrics, _step)
-            self.metric_logger.log(real_env_metrics, _step)
+            self._log_metrics(env_metrics, _step)
+            self._log_metrics(rollout_metrics, _step)
+            self._log_metrics(time_metrics, _step)
+            self._log_metrics(training_metrics, _step)
+            self._log_metrics(real_env_metrics, _step)
             if wm_metrics:
-                self.metric_logger.log(wm_metrics, _step)
+                non_init_wm_metrics = {
+                    k: v for k, v in wm_metrics.items() if not k.startswith("wm_init/")
+                }
+                if non_init_wm_metrics:
+                    self._log_metrics(non_init_wm_metrics, _step)
             if wm_status_metrics:
-                self.metric_logger.log(wm_status_metrics, _step)
+                self._log_metrics(wm_status_metrics, _step)
 
             logging_metrics = {}
             logging_metrics.update(time_metrics)
@@ -509,7 +589,13 @@ class EmbodiedMBPORunner:
             logging_metrics.update(training_metrics)
             logging_metrics.update(real_env_metrics)
             if wm_metrics:
-                logging_metrics.update(wm_metrics)
+                logging_metrics.update(
+                    {
+                        k: v
+                        for k, v in wm_metrics.items()
+                        if not k.startswith("wm_init/")
+                    }
+                )
             if wm_status_metrics:
                 logging_metrics.update(wm_status_metrics)
 

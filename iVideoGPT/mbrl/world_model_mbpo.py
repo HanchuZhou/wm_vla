@@ -5,7 +5,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import cv2
 import imageio
@@ -85,6 +85,11 @@ class WorldModelMBPO:
         self.total_env_steps = 0
         self.init_model = False
         self.init_gen = False
+        self.wm_init_update_step = 0
+
+        self._val_psnr = None
+        self._val_ssim = None
+        self._val_lpips = None
 
         self._setup_replay_buffers()
         self._setup_world_model()
@@ -474,7 +479,95 @@ class WorldModelMBPO:
     def _policy_predict(self, obs: torch.Tensor, task_descs: list[str]):
         return self._policy_predict_with_model(self.policy_model, obs, task_descs)
 
-    def maybe_update_world_model(self, env_steps: int) -> dict[str, float]:
+    @staticmethod
+    def _to_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            if torch.is_tensor(value):
+                if value.numel() == 0:
+                    return None
+                return float(value.detach().float().mean().item())
+            return float(value)
+        except Exception:
+            return None
+
+    def _ensure_validation_frame_metrics(self) -> bool:
+        if (
+            self._val_psnr is not None
+            and self._val_ssim is not None
+            and self._val_lpips is not None
+        ):
+            return True
+        try:
+            import piqa
+            from ivideogpt.vq_model import LPIPS
+
+            self._val_psnr = piqa.PSNR(
+                epsilon=1e-8,
+                value_range=1.0,
+                reduction="none",
+            ).to(self.device)
+            self._val_ssim = piqa.SSIM(
+                window_size=11,
+                sigma=1.5,
+                n_channels=3,
+                reduction="none",
+            ).to(self.device)
+            self._val_lpips = LPIPS().to(self.device).eval()
+            return True
+        except Exception:
+            return False
+
+    def _compute_fallback_frame_metrics(
+        self,
+        gt_flat: torch.Tensor,
+        pred_flat: torch.Tensor,
+    ) -> tuple[float, float, float]:
+        eps = 1e-8
+        mse = torch.mean((gt_flat - pred_flat) ** 2)
+        psnr = 10.0 * torch.log10(1.0 / torch.clamp(mse, min=eps))
+
+        mu_x = gt_flat.mean(dim=(1, 2, 3), keepdim=True)
+        mu_y = pred_flat.mean(dim=(1, 2, 3), keepdim=True)
+        var_x = ((gt_flat - mu_x) ** 2).mean(dim=(1, 2, 3), keepdim=True)
+        var_y = ((pred_flat - mu_y) ** 2).mean(dim=(1, 2, 3), keepdim=True)
+        cov_xy = ((gt_flat - mu_x) * (pred_flat - mu_y)).mean(
+            dim=(1, 2, 3), keepdim=True
+        )
+        c1 = 0.01 ** 2
+        c2 = 0.03 ** 2
+        ssim = (
+            (2.0 * mu_x * mu_y + c1)
+            * (2.0 * cov_xy + c2)
+            / ((mu_x * mu_x + mu_y * mu_y + c1) * (var_x + var_y + c2) + eps)
+        ).mean()
+
+        lpips_value = None
+        lpips_model = getattr(self.video_predictor, "lpips", None)
+        if lpips_model is not None:
+            try:
+                lpips_value = lpips_model(
+                    gt_flat.contiguous() * 2.0 - 1.0,
+                    pred_flat.contiguous() * 2.0 - 1.0,
+                    weight=None,
+                ).mean()
+            except Exception:
+                lpips_value = None
+        if lpips_value is None:
+            lpips_value = torch.mean(torch.abs(gt_flat - pred_flat))
+
+        return (
+            float(psnr.item()),
+            float(ssim.item()),
+            float(lpips_value.item()),
+        )
+
+    def maybe_update_world_model(
+        self,
+        env_steps: int,
+        init_step_logger: Optional[Callable[[dict[str, float]], None]] = None,
+    ) -> dict[str, float]:
         metrics = {}
         updated = False
         if env_steps < self.cfg.num_seed_frames:
@@ -491,18 +584,31 @@ class WorldModelMBPO:
                     leave=False,
                     ncols=120,
                 )
-            for idx in init_iter:
+            for _ in init_iter:
                 batch = next(self._get_seg_replay_iter())
                 update_tokenizer = getattr(
                     self.cfg.world_model, "seed_update_tokenizer", True
                 )
                 metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
                 updated = True
+                self.wm_init_update_step += 1
+                if init_step_logger is not None and metrics:
+                    payload = {
+                        "wm_init/update_step": float(self.wm_init_update_step),
+                    }
+                    for key, value in metrics.items():
+                        cast_value = self._to_float(value)
+                        if cast_value is not None:
+                            payload[f"wm_init/{key}"] = cast_value
+                    if len(payload) > 1:
+                        init_step_logger(payload)
             self.video_predictor.save_snapshot(self.work_dir, suffix="_init")
             self.init_model = True
             if updated:
                 self._mark_generation_replicas_stale()
-            return {f"wm_init/{k}": v for k, v in metrics.items()}
+            output_metrics = {f"wm_init/{k}": v for k, v in metrics.items()}
+            output_metrics["wm_init/update_step"] = float(self.wm_init_update_step)
+            return output_metrics
 
         if self.cfg.update_gen_every_step > 0 and env_steps % self.cfg.update_gen_every_step == 0:
             if self.replay_storage._num_episodes == 0 and not self._has_demo:
@@ -764,95 +870,184 @@ class WorldModelMBPO:
         global_step: int,
         num_gifs: int = 1,
         fps: int = 4,
+        num_metric_batches: int = 1,
     ) -> dict[str, float]:
         if self.replay_storage._num_episodes == 0 and not self._has_demo:
             print("[stage] world model validate skipped (empty replay buffer and no demos)")
             return {}
-        batch = next(self._get_seg_replay_iter())
-        obs_gt = torch.cat(
-            [batch[0][:, :-2], batch[0][:, 1:-1], batch[0][:, 2:]], dim=2
-        )
-        action = batch[1][:, 2:]
-        reward_gt = batch[2][:, 2:]
-        policy = lambda obs, step: action[:, step].to(obs.device)
-        obs_pred, _, reward_pred = self.video_predictor.rollout(
-            obs_gt[:, 0],
-            policy,
-            obs_gt.shape[1] - 1,
-            do_sample=False,
-        )
 
-        obs_mse = (
-            (obs_pred[:, 1:] - (obs_gt[:, 1:] / 255.0).to(obs_pred.device)) ** 2
-        ).mean()
-        reward_mse = (
-            (reward_pred[:, 1:] - reward_gt[:, 1:].to(reward_pred.device)) ** 2
-        ).mean()
-        action_norms = torch.linalg.norm(action, dim=-1).reshape(-1)
-        if action_norms.numel() > 0:
+        num_metric_batches = max(1, int(num_metric_batches))
+        enable_frame_metrics = self._ensure_validation_frame_metrics()
+
+        obs_mse_total = 0.0
+        reward_mse_total = 0.0
+        psnr_total = 0.0
+        ssim_total = 0.0
+        lpips_total = 0.0
+        frame_metric_count = 0
+
+        action_norm_sum = 0.0
+        action_norm_count = 0
+        action_norm_min = float("inf")
+        action_norm_max = float("-inf")
+
+        gif_obs_gt = None
+        gif_obs_pred = None
+        gif_reward_gt = None
+        gif_reward_pred = None
+
+        for metric_batch_idx in range(num_metric_batches):
+            batch = next(self._get_seg_replay_iter())
+            obs_gt = torch.cat(
+                [batch[0][:, :-2], batch[0][:, 1:-1], batch[0][:, 2:]], dim=2
+            )
+            action = batch[1][:, 2:]
+            reward_gt = batch[2][:, 2:]
+            policy = lambda obs, step: action[:, step].to(obs.device)
+            obs_pred, _, reward_pred = self.video_predictor.rollout(
+                obs_gt[:, 0],
+                policy,
+                obs_gt.shape[1] - 1,
+                do_sample=False,
+            )
+
+            obs_mse = (
+                (obs_pred[:, 1:] - (obs_gt[:, 1:] / 255.0).to(obs_pred.device)) ** 2
+            ).mean()
+            reward_mse = (
+                (reward_pred[:, 1:] - reward_gt[:, 1:].to(reward_pred.device)) ** 2
+            ).mean()
+            obs_mse_total += float(obs_mse.item())
+            reward_mse_total += float(reward_mse.item())
+
+            action_norms = torch.linalg.norm(action, dim=-1).reshape(-1)
+            if action_norms.numel() > 0:
+                action_norm_sum += float(action_norms.sum().item())
+                action_norm_count += int(action_norms.numel())
+                action_norm_min = min(action_norm_min, float(action_norms.min().item()))
+                action_norm_max = max(action_norm_max, float(action_norms.max().item()))
+
+            gt_rgb = (
+                obs_gt[:, 1:, -3:].to(self.device).float() / 255.0
+            ).clamp(0.0, 1.0)
+            pred_rgb = obs_pred[:, 1:, -3:].to(self.device).float().clamp(0.0, 1.0)
+
+            bsz, timesteps, channels, height, width = gt_rgb.shape
+            gt_flat = gt_rgb.reshape(bsz * timesteps, channels, height, width)
+            pred_flat = pred_rgb.reshape(bsz * timesteps, channels, height, width)
+
+            if enable_frame_metrics:
+                psnr = self._val_psnr(gt_flat, pred_flat).mean()
+                ssim = self._val_ssim(gt_flat, pred_flat).mean()
+                lpips = self._val_lpips(
+                    gt_flat.contiguous() * 2.0 - 1.0,
+                    pred_flat.contiguous() * 2.0 - 1.0,
+                    weight=None,
+                ).mean()
+                psnr_total += float(psnr.item())
+                ssim_total += float(ssim.item())
+                lpips_total += float(lpips.item())
+                frame_metric_count += 1
+            else:
+                psnr, ssim, lpips = self._compute_fallback_frame_metrics(
+                    gt_flat=gt_flat,
+                    pred_flat=pred_flat,
+                )
+                psnr_total += psnr
+                ssim_total += ssim
+                lpips_total += lpips
+                frame_metric_count += 1
+
+            if metric_batch_idx == 0:
+                gif_obs_gt = obs_gt.detach().cpu()
+                gif_obs_pred = obs_pred.detach().cpu()
+                gif_reward_gt = reward_gt.detach().cpu()
+                gif_reward_pred = reward_pred.detach().cpu()
+
+        if action_norm_count > 0:
+            action_norm_mean = action_norm_sum / action_norm_count
             print(
                 "[validate] action_norm mean="
-                f"{action_norms.mean().item():.4f}, min={action_norms.min().item():.4f}, "
-                f"max={action_norms.max().item():.4f}"
+                f"{action_norm_mean:.4f}, min={action_norm_min:.4f}, "
+                f"max={action_norm_max:.4f}"
             )
+        else:
+            action_norm_mean = 0.0
+            action_norm_min = 0.0
+            action_norm_max = 0.0
 
         if num_gifs > 0:
             gif_dir = self.work_dir / "validate_gif"
             gif_dir.mkdir(parents=True, exist_ok=True)
-            gif_count = min(int(num_gifs), int(obs_gt.shape[0]))
-            for i in range(gif_count):
-                gif_path = gif_dir / f"val-sample-{global_step}-{i}.gif"
-                frames = []
-                for t in range(obs_gt.shape[1]):
-                    frame = (
-                        obs_gt[i, t, -3:]
-                        .permute(1, 2, 0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    ).astype(np.uint8)
-                    frame = np.ascontiguousarray(frame)
-                    frame_pred = (
-                        obs_pred[i, t, -3:]
-                        .permute(1, 2, 0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        * 255.0
-                    ).astype(np.uint8)
-                    frame_pred = np.ascontiguousarray(frame_pred)
-                    frame_error = np.abs(
-                        frame.astype(np.float32) - frame_pred.astype(np.float32)
-                    ).astype(np.uint8)
-                    if t > 0:
-                        cv2.putText(
-                            frame,
-                            f"{reward_gt[i, t].item():.2f}",
-                            (10, 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.3,
-                            (255, 255, 255),
-                            1,
+            if gif_obs_gt is not None and gif_obs_pred is not None:
+                gif_count = min(int(num_gifs), int(gif_obs_gt.shape[0]))
+                for i in range(gif_count):
+                    gif_path = gif_dir / f"val-sample-{global_step}-{i}.gif"
+                    frames = []
+                    for t in range(gif_obs_gt.shape[1]):
+                        frame = (
+                            gif_obs_gt[i, t, -3:]
+                            .permute(1, 2, 0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        ).astype(np.uint8)
+                        frame = np.ascontiguousarray(frame)
+                        frame_pred = (
+                            gif_obs_pred[i, t, -3:]
+                            .permute(1, 2, 0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            * 255.0
+                        ).astype(np.uint8)
+                        frame_pred = np.ascontiguousarray(frame_pred)
+                        frame_error = np.abs(
+                            frame.astype(np.float32) - frame_pred.astype(np.float32)
+                        ).astype(np.uint8)
+                        if t > 0:
+                            cv2.putText(
+                                frame,
+                                f"{gif_reward_gt[i, t].item():.2f}",
+                                (10, 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.3,
+                                (255, 255, 255),
+                                1,
+                            )
+                            cv2.putText(
+                                frame_pred,
+                                f"{gif_reward_pred[i, t].item():.2f}",
+                                (10, 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.3,
+                                (255, 255, 255),
+                                1,
+                            )
+                        frames.append(
+                            np.concatenate([frame, frame_pred, frame_error], axis=1)
                         )
-                        cv2.putText(
-                            frame_pred,
-                            f"{reward_pred[i, t].item():.2f}",
-                            (10, 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.3,
-                            (255, 255, 255),
-                            1,
-                        )
-                    frames.append(np.concatenate([frame, frame_pred, frame_error], axis=1))
-                imageio.mimsave(str(gif_path), frames, fps=fps, loop=0)
+                    imageio.mimsave(str(gif_path), frames, fps=fps, loop=0)
 
-        return {
-            "val/obs_mse": obs_mse.item(),
-            "val/reward_mse": reward_mse.item(),
-            "val/action_norm_mean": action_norms.mean().item() if action_norms.numel() else 0.0,
-            "val/action_norm_min": action_norms.min().item() if action_norms.numel() else 0.0,
-            "val/action_norm_max": action_norms.max().item() if action_norms.numel() else 0.0,
+        metrics = {
+            "val/obs_mse": obs_mse_total / float(num_metric_batches),
+            "val/reward_mse": reward_mse_total / float(num_metric_batches),
+            "val/action_norm_mean": action_norm_mean,
+            "val/action_norm_min": action_norm_min,
+            "val/action_norm_max": action_norm_max,
+            "val/metric_batches": float(num_metric_batches),
         }
+
+        denom = max(1.0, float(frame_metric_count))
+        metrics["val/psnr"] = psnr_total / denom
+        metrics["val/ssim"] = ssim_total / denom
+        metrics["val/lpips"] = lpips_total / denom
+        # Keep uppercase aliases to make dashboard filtering straightforward.
+        metrics["val/PSNR"] = metrics["val/psnr"]
+        metrics["val/SSIM"] = metrics["val/ssim"]
+        metrics["val/LPIPS"] = metrics["val/lpips"]
+
+        return metrics
 
     def should_start_mbpo(self, env_steps: int) -> bool:
         return env_steps >= self.cfg.start_mbpo

@@ -22,7 +22,7 @@ video_cfg:
   info_on_video: True
   video_base_dir: ${runner.logger.log_path}/video/eval
   format: gif
-  fps: 10
+  fps: 20
   max_render_envs: 1
   stop_on_success: true
   use_seed_subdir: false

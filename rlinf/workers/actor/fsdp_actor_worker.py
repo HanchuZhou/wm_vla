@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -57,6 +58,17 @@ from rlinf.utils.utils import (
     seq_mean_token_sum,
 )
 from rlinf.workers.rollout.utils import RankMapper
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"When using ``NO_SHARD`` for ``ShardingStrategy``, full_state_dict willbe returned\.",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"FSDP\.state_dict_type\(\) and FSDP\.set_state_dict_type\(\) are being deprecated\..*",
+    category=FutureWarning,
+)
 
 
 class FSDPActor(FSDPModelManager, Worker):

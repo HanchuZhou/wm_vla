@@ -1,9 +1,11 @@
 import asyncio
+from collections import defaultdict
 import os
 import time
 from pathlib import Path
 from typing import Optional
 
+import torch
 from omegaconf.dictconfig import DictConfig
 from tqdm import tqdm
 
@@ -295,12 +297,82 @@ class EmbodiedMBPORunner:
         return env_metrics, real_env_interactions
 
     def evaluate(self):
-        env_futures = self.env.evaluate()
-        rollout_futures = self.rollout.evaluate()
-        env_results = env_futures.wait()
-        rollout_futures.wait()
-        eval_metrics_list = [results for results in env_results if results is not None]
-        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        target_eval_episodes = int(getattr(self.cfg, "num_eval_episodes", 0) or 0)
+        # Backward compatible path: keep legacy one-pass eval if target is disabled.
+        if target_eval_episodes <= 0:
+            env_futures = self.env.evaluate()
+            rollout_futures = self.rollout.evaluate()
+            env_results = env_futures.wait()
+            rollout_futures.wait()
+            eval_metrics_list = [results for results in env_results if results is not None]
+            eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+            return eval_metrics
+
+        max_eval_passes = int(self.cfg.runner.get("max_eval_passes", 100))
+        collected_metrics = defaultdict(list)
+        collected_episode_count = 0
+
+        for _ in range(max_eval_passes):
+            env_futures = self.env.evaluate()
+            rollout_futures = self.rollout.evaluate()
+            env_results = env_futures.wait()
+            rollout_futures.wait()
+            eval_metrics_list = [results for results in env_results if results is not None]
+            if not eval_metrics_list:
+                break
+
+            pass_episode_count = 0
+            for metrics in eval_metrics_list:
+                for key, value in metrics.items():
+                    if value is None:
+                        continue
+                    tensor_value = (
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                    )
+                    tensor_value = tensor_value.detach().cpu().reshape(-1)
+                    if tensor_value.numel() == 0:
+                        continue
+                    collected_metrics[key].append(tensor_value)
+                success_once = metrics.get("success_once", None)
+                if success_once is None:
+                    continue
+                success_once = (
+                    success_once
+                    if torch.is_tensor(success_once)
+                    else torch.as_tensor(success_once)
+                )
+                pass_episode_count += int(success_once.numel())
+
+            collected_episode_count += pass_episode_count
+            if collected_episode_count >= target_eval_episodes:
+                break
+
+        if not collected_metrics:
+            return {}
+
+        eval_metrics = {}
+        keys_without_episode_denominator = {"policy_action_entropy"}
+        for key, chunks in collected_metrics.items():
+            values = torch.cat(chunks, dim=0)
+            if values.numel() == 0:
+                continue
+            if key not in keys_without_episode_denominator:
+                values = values[:target_eval_episodes]
+            eval_metrics[key] = values.float().mean().numpy()
+
+        effective_episode_count = 0
+        if "success_once" in collected_metrics:
+            effective_episode_count = min(
+                target_eval_episodes, int(torch.cat(collected_metrics["success_once"]).numel())
+            )
+        eval_metrics["episode_count"] = float(effective_episode_count)
+
+        if effective_episode_count < target_eval_episodes:
+            print(
+                "[warn] eval collected fewer episodes than requested: "
+                f"{effective_episode_count}/{target_eval_episodes}"
+            )
+
         return eval_metrics
 
     def run(self):

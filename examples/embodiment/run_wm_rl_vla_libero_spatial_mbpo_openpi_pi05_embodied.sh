@@ -17,6 +17,8 @@ MBPO_DEMO="${MBPO_DEMO:-true}"
 MBPO_WM_UPDATE_EVERY="${MBPO_WM_UPDATE_EVERY:-}"
 MBPO_GPU="${MBPO_GPU:-0}"
 VLA_GPUS="${VLA_GPUS:-1,2,3}"
+FORCE_SET_CUDA_VISIBLE_DEVICES="${FORCE_SET_CUDA_VISIBLE_DEVICES:-1}"
+RAY_RESTART_LOCAL="${RAY_RESTART_LOCAL:-0}"
 
 parse_gpu_csv() {
   local csv="$1"
@@ -86,8 +88,19 @@ if [[ "${MUJOCO_GL}" == "egl" ]]; then
   if [[ -z "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" && -f "/opt/nvidia-egl/egl_vendor.d/10_nvidia.json" ]]; then
     export __EGL_VENDOR_LIBRARY_FILENAMES="/opt/nvidia-egl/egl_vendor.d/10_nvidia.json"
   fi
-  if [[ -d "/opt/nvidia-egl/lib" ]]; then
-    export LD_LIBRARY_PATH="/opt/nvidia-egl/lib:/.singularity.d/libs${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  # Keep host driver libs first to avoid NVML/NCCL driver-library mismatches.
+  NVIDIA_LIB_PATHS=()
+  [[ -d "/.singularity.d/libs" ]] && NVIDIA_LIB_PATHS+=("/.singularity.d/libs")
+  [[ -d "/usr/local/nvidia/lib64" ]] && NVIDIA_LIB_PATHS+=("/usr/local/nvidia/lib64")
+  [[ -d "/usr/local/nvidia/lib" ]] && NVIDIA_LIB_PATHS+=("/usr/local/nvidia/lib")
+  for p in "${NVIDIA_LIB_PATHS[@]}"; do
+    if [[ ":${LD_LIBRARY_PATH:-}:" != *":${p}:"* ]]; then
+      export LD_LIBRARY_PATH="${p}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
+  done
+  # EGL helper path is appended so it does not override host NVML.
+  if [[ -d "/opt/nvidia-egl/lib" && ":${LD_LIBRARY_PATH:-}:" != *":/opt/nvidia-egl/lib:"* ]]; then
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/opt/nvidia-egl/lib"
   fi
 fi
 
@@ -101,10 +114,20 @@ for sub in assets bddl_files init_files; do
 done
 
 # Build CUDA_VISIBLE_DEVICES so MBPO GPUs are first and VLA GPUs follow.
-if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  export CUDA_VISIBLE_DEVICES="${MBPO_GPU_CSV}"
-  if [[ -n "${VLA_GPU_CSV}" ]]; then
-    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES},${VLA_GPU_CSV}"
+TARGET_CUDA_VISIBLE_DEVICES="${MBPO_GPU_CSV}"
+if [[ -n "${VLA_GPU_CSV}" ]]; then
+  TARGET_CUDA_VISIBLE_DEVICES="${TARGET_CUDA_VISIBLE_DEVICES},${VLA_GPU_CSV}"
+fi
+
+if [[ "${FORCE_SET_CUDA_VISIBLE_DEVICES}" == "1" ]]; then
+  export CUDA_VISIBLE_DEVICES="${TARGET_CUDA_VISIBLE_DEVICES}"
+elif [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${TARGET_CUDA_VISIBLE_DEVICES}"
+else
+  echo "[launch] preserving pre-set CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" >&2
+  if [[ "${CUDA_VISIBLE_DEVICES}" != "${TARGET_CUDA_VISIBLE_DEVICES}" ]]; then
+    echo "[launch warning] requested MBPO/VLA GPUs imply CUDA_VISIBLE_DEVICES=${TARGET_CUDA_VISIBLE_DEVICES}, but current value is ${CUDA_VISIBLE_DEVICES}." >&2
+    echo "[launch warning] set FORCE_SET_CUDA_VISIBLE_DEVICES=1 (default) to enforce the requested mapping." >&2
   fi
 fi
 
@@ -128,6 +151,49 @@ export USE_TF="${USE_TF:-0}"
 export USE_TB="${USE_TB:-0}"
 export USE_FLAX="${USE_FLAX:-0}"
 export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export RAY_NUM_CPUS="${RAY_NUM_CPUS:-48}"
+export RAY_OBJECT_STORE_BYTES="${RAY_OBJECT_STORE_BYTES:-17179869184}"
+export RAY_ADDRESS="${RAY_ADDRESS:-local}"
+export RLINF_NAMESPACE="${RLINF_NAMESPACE:-wm_vla_${MBPO_TASK_NAME}_$(date +%Y%m%d_%H%M%S)_$$}"
+
+if [[ "${RAY_RESTART_LOCAL}" == "1" ]]; then
+  echo "[launch warning] RAY_RESTART_LOCAL=1, stopping any existing local Ray cluster on this node."
+  unset RAY_ADDRESS
+  if command -v ray >/dev/null 2>&1; then
+    ray stop --force >/dev/null 2>&1 || true
+  fi
+fi
+
+# Ensure model/cache downloads always go to writable paths.
+ensure_writable_dir() {
+  local preferred="$1"
+  local fallback="$2"
+
+  if [[ -n "${preferred}" ]] && mkdir -p "${preferred}" 2>/dev/null && [[ -w "${preferred}" ]]; then
+    echo "${preferred}"
+    return 0
+  fi
+
+  if mkdir -p "${fallback}" 2>/dev/null && [[ -w "${fallback}" ]]; then
+    echo "${fallback}"
+    return 0
+  fi
+
+  echo "[launch error] No writable directory available (preferred='${preferred}', fallback='${fallback}')." >&2
+  exit 1
+}
+
+DEFAULT_CACHE_ROOT="${REPO_PATH}/.cache"
+TMP_CACHE_ROOT="/tmp/${USER:-wm_vla}/wm_vla_cache"
+CACHE_ROOT="$(ensure_writable_dir "${CACHE_ROOT:-${DEFAULT_CACHE_ROOT}}" "${TMP_CACHE_ROOT}")"
+export CACHE_ROOT
+
+export HF_HOME="$(ensure_writable_dir "${HF_HOME:-${CACHE_ROOT}/huggingface}" "${CACHE_ROOT}/huggingface")"
+export TORCH_HOME="$(ensure_writable_dir "${TORCH_HOME:-${CACHE_ROOT}/torch}" "${CACHE_ROOT}/torch")"
+export HUGGINGFACE_HUB_CACHE="$(ensure_writable_dir "${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}" "${HF_HOME}/hub")"
+export TRANSFORMERS_CACHE="$(ensure_writable_dir "${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}" "${HF_HOME}/transformers")"
+export NUMBA_CACHE_DIR="$(ensure_writable_dir "${NUMBA_CACHE_DIR:-${CACHE_ROOT}/numba_cache}" "${CACHE_ROOT}/numba_cache")"
 
 HOST_SITE="${REPO_PATH}/.singularity_pkgs/ivideogpt"
 OPENPI_SITE="/opt/venv/openpi/lib/python3.11/site-packages"
@@ -199,6 +265,68 @@ fi
 echo "[launch] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[launch] MBPO host GPUs=${MBPO_GPU_CSV} (logical cuda:0-$((MBPO_GPU_COUNT - 1)))"
 echo "[launch] VLA host GPUs=${VLA_GPU_CSV} (placement=${VLA_PLACEMENT})"
+echo "[launch] HF_HOME=${HF_HOME}"
+echo "[launch] TORCH_HOME=${TORCH_HOME}"
+echo "[launch] NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR}"
+echo "[launch] RLINF_NAMESPACE=${RLINF_NAMESPACE}"
+echo "[launch] RAY_ADDRESS=${RAY_ADDRESS}"
+echo "[launch] RAY_RESTART_LOCAL=${RAY_RESTART_LOCAL}"
+echo "[launch] RAY_NUM_CPUS=${RAY_NUM_CPUS}"
+echo "[launch] RAY_OBJECT_STORE_BYTES=${RAY_OBJECT_STORE_BYTES}"
+echo "[launch] LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+
+# Fail fast if NVML cannot initialize with current library resolution.
+python - <<'PY'
+import ctypes
+import sys
+
+name = "libnvidia-ml.so.1"
+try:
+    nvml = ctypes.CDLL(name)
+except OSError as e:
+    print(f"[launch error] Failed to load NVML library ({name}): {e}", file=sys.stderr)
+    sys.exit(1)
+
+nvml.nvmlErrorString.restype = ctypes.c_char_p
+
+def err(rc):
+    try:
+        return nvml.nvmlErrorString(ctypes.c_int(rc)).decode("utf-8", errors="replace")
+    except Exception:
+        return f"code={rc}"
+
+rc = int(nvml.nvmlInit_v2())
+if rc != 0:
+    print(f"[launch error] nvmlInit_v2 failed: {err(rc)}", file=sys.stderr)
+    sys.exit(1)
+
+count = ctypes.c_uint(0)
+rc = int(nvml.nvmlDeviceGetCount_v2(ctypes.byref(count)))
+if rc != 0:
+    print(f"[launch error] nvmlDeviceGetCount_v2 failed: {err(rc)}", file=sys.stderr)
+    sys.exit(1)
+
+loaded_path = "unknown"
+try:
+    with open("/proc/self/maps", "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if "libnvidia-ml.so" in line:
+                loaded_path = line.strip().split()[-1]
+                break
+except Exception:
+    pass
+
+print(f"[launch] NVML library path={loaded_path}")
+print(f"[launch] NVML check passed, visible GPU count={count.value}")
+
+try:
+    import torch
+    print(f"[launch] torch.cuda.device_count={torch.cuda.device_count()}")
+except Exception as e:
+    print(f"[launch warning] torch.cuda.device_count check failed: {e}")
+
+nvml.nvmlShutdown()
+PY
 
 CMD=(python "${REPO_PATH}/examples/embodiment/train_embodied_agent_mbpo_openpi.py" \
   --config-path "${REPO_PATH}/examples/embodiment/config" \

@@ -36,7 +36,12 @@ todo:
 4. wm make sure it will not updated if frozen
 5. wm make sure the training, generation and validation are in the same episode
 6. wm eval metric
-7. train.loss is very high
+7. add wandb login to make sure we login everytime
+8. try to use vanilla pi_0.5 as policy
+9. action entropy of policy
+10. train.loss is very high
+11. interpolation
+
 
 To reproduce the WM_VLA run used here:
 1. **Download LIBERO demos** (official release):

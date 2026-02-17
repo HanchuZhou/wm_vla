@@ -6,6 +6,9 @@ REPO_PATH="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export REPO_PATH
 export PRETRAINED_ROOT="${REPO_PATH}/pretrained_models"
 export EMBODIED_PATH="${SCRIPT_DIR}"
+# Avoid host-side LD_PRELOAD entries leaking into singularity payloads.
+# This suppresses repeated non-fatal loader warnings like missing libffi.so.7.
+unset LD_PRELOAD
 
 MBPO_TASK_NAME="${MBPO_TASK_NAME:-libero_spatial}"
 MBPO_CONFIG="${MBPO_CONFIG:-libero_spatial_mbpo_openpi_pi05}"
@@ -124,14 +127,32 @@ export MS_SKIP_ASSET_DOWNLOAD_PROMPT=1
 export USE_TF="${USE_TF:-0}"
 export USE_TB="${USE_TB:-0}"
 export USE_FLAX="${USE_FLAX:-0}"
+export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
 
 HOST_SITE="${REPO_PATH}/.singularity_pkgs/ivideogpt"
 OPENPI_SITE="/opt/venv/openpi/lib/python3.11/site-packages"
 export PYTHONPATH="${HOST_SITE}:${OPENPI_SITE}:${REPO_PATH}:${REPO_PATH}/iVideoGPT:${REPO_PATH}/iVideoGPT/mbrl${PYTHONPATH:+:${PYTHONPATH}}"
 
-if [[ -z "${WANDB_API_KEY:-}" ]]; then
-  export WANDB_MODE="${WANDB_MODE:-offline}"
-  export WANDB_SILENT="${WANDB_SILENT:-true}"
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+  echo "[wandb] WANDB_API_KEY detected; logging in before training."
+  if ! python -m wandb login --relogin "${WANDB_API_KEY}" >/dev/null 2>&1; then
+    echo "[wandb] login failed; falling back to offline mode." >&2
+    export WANDB_MODE=offline
+    export WANDB_SILENT="${WANDB_SILENT:-true}"
+  else
+    export WANDB_MODE="${WANDB_MODE:-online}"
+  fi
+else
+  if [[ -z "${WANDB_MODE:-}" ]]; then
+    if [[ -f "${HOME}/.netrc" ]] && grep -q "api.wandb.ai" "${HOME}/.netrc"; then
+      echo "[wandb] existing login found in ${HOME}/.netrc; using online mode."
+      export WANDB_MODE=online
+    else
+      echo "[wandb] no WANDB_API_KEY/login found; defaulting to offline mode." >&2
+      export WANDB_MODE=offline
+      export WANDB_SILENT="${WANDB_SILENT:-true}"
+    fi
+  fi
 fi
 
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H%M%S')"

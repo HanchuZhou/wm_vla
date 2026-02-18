@@ -1039,13 +1039,9 @@ class WorldModelMBPO:
         }
 
         denom = max(1.0, float(frame_metric_count))
-        metrics["val/psnr"] = psnr_total / denom
-        metrics["val/ssim"] = ssim_total / denom
-        metrics["val/lpips"] = lpips_total / denom
-        # Keep uppercase aliases to make dashboard filtering straightforward.
-        metrics["val/PSNR"] = metrics["val/psnr"]
-        metrics["val/SSIM"] = metrics["val/ssim"]
-        metrics["val/LPIPS"] = metrics["val/lpips"]
+        metrics["val/psnr↑"] = psnr_total / denom
+        metrics["val/ssim↑"] = ssim_total / denom
+        metrics["val/lpips↓"] = lpips_total / denom
 
         return metrics
 

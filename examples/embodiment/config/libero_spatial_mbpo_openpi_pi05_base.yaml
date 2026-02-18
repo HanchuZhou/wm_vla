@@ -1,0 +1,282 @@
+defaults:
+  - env/train: libero_spatial
+  - env/eval: libero_spatial
+  - pretrained_vgm: 64_small
+  - override hydra/job_logging: stdout
+
+repo_root: ${oc.env:REPO_PATH,/home/ucdavis/wm_vla}
+pretrained_root: ${oc.env:PRETRAINED_ROOT,${repo_root}/pretrained_models}
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    "actor,env,rollout": ${oc.env:VLA_PLACEMENT,1-3}
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    project: ${task_name}
+    entity: flare-robot
+    team: flare-robot
+    org: ucd-dare
+    experiment_name: "mbpo_pi05_base"
+    logger_backends: ["tensorboard", "wandb"]
+
+  max_epochs: 1000
+  max_steps: -1
+
+  val_check_interval: 2
+  save_eval_and_val_gif: true
+  num_gif_every_steps: 1
+  real_rollout_every_steps: -1
+  save_interval: -1 # for checkpoint saving, not for gif saving
+  seq_length: 4096
+  max_prompt_length: 50
+
+# ===== MBPO / World Model settings =====
+# task-level
+name: "0"
+task_name: libero_spatial
+frame_stack: 3
+action_repeat: 1
+discount: 0.99
+num_train_frames: 1000002
+num_seed_frames: 0
+num_eval_episodes: 10
+
+save_snapshot: true
+replay_buffer_size: 1000000
+replay_buffer_num_workers: 1
+nstep: 3
+batch_size: 256
+
+demo_path_prefix: ${repo_root}/iVideoGPT/mbrl/demonstrations
+demo: true
+
+seed: 1
+device: cuda
+save_video: true
+save_train_video: false
+use_tb: ${oc.env:USE_TB,false}
+
+gen_every_steps: 1
+gen_batch: 32
+gen_horizon: 10
+update_gen_every_step: 2
+update_tokenizer_every_step: 2
+update_gen_times: 1
+init_update_gen_steps: 1000
+init_gen_times: 20
+real_ratio: 0.5
+start_mbpo: 5
+
+world_model:
+  enable: true
+  device: cuda:0
+  # Optional generation devices for imagined rollout.
+  # If null, generation runs only on `world_model.device`.
+  # Example override: `world_model.gen_devices=[cuda:0,cuda:1,cuda:2]`
+  gen_devices: null
+  channel:
+    name: "wm_buffer"
+    queue_name: "wm_step_buffer"
+    queue_size: 0
+
+  load_pretrained_model: true
+  train_param_dtype: fp32
+  rollout_do_sample: true
+  rollout_force_fp32: true
+  rollout_log_stats: true
+  vqgan_type: ctx_vqgan
+  load_internal_llm: true
+  llama_attn_drop: 0.1
+  fast_reward_predictor: false
+  symlog: true
+
+  context_length: 2
+  segment_length: 12
+  action_dim: ${actor.model.action_dim}
+  state_dim: 8
+
+  batch_size: 16
+  selected_params: true
+  tok_lr: 1e-4
+  tok_wd: 0.0
+  tok_beta1: 0.9
+  tok_beta2: 0.999
+  max_grad_norm: 1.0
+  max_target_frames: 5
+
+  model_lr: 1e-4
+  model_wd: 0.0
+  embed_no_wd: true
+
+  reward_lr: 1e-4
+  reward_wd: 1e-6
+  reward_weight: 1.0
+  show_progress: true
+  val_metric_batches: 10
+  val_metric_max_batchsize: 16
+
+# ===== RLinf algorithm =====
+algorithm:
+  auto_reset: False
+  ignore_terminations: False
+  use_fixed_reset_state_ids: True
+  normalize_advantages: True
+  kl_penalty: kl
+  group_size: 1
+  max_episode_steps: 240
+  use_ordered_reset_state_ids: False
+  reward_coef: 1.0
+  n_chunk_steps: ${int_div:${algorithm.max_episode_steps}, ${actor.model.num_action_chunks}}
+  n_eval_chunk_steps: ${int_div:${env.eval.max_episode_steps}, ${actor.model.num_action_chunks}}
+  num_group_envs: 64  # For advantage grouping
+  rollout_epoch: 8
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+  update_epoch: 1
+
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  filter_rewards: False
+  rewards_lower_bound: 0.1
+  rewards_upper_bound: 0.9
+
+  sampling_params:
+    use_greedy: False
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: False
+
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+  channel:
+    name: "env_buffer_list"
+    queue_name: "obs_buffer"
+    queue_size: 0
+  enable_offload: False
+  train:
+    video_cfg:
+      save_video: False
+
+rollout:
+  group_name: "RolloutGroup"
+  channel:
+    name: ${env.channel.name}
+    queue_name: "action_buffer"
+    queue_size: 0
+  mode: "colocate"
+  generation_backend: "huggingface"
+  model_dir: "${pretrained_root}/pi05_base"
+  precision: ${actor.model.precision}
+  recompute_logprobs: False
+  unnorm_key: libero_spatial
+  enable_offload: False
+  pipeline_stage_num: 1
+
+actor:
+  group_name: "ActorGroup"
+  channel:
+    name: ${env.channel.name}
+    queue_name: "replay_buffer"
+    queue_size: 0
+  training_backend: "fsdp"
+  checkpoint_load_path: "${pretrained_root}/pi05_base"
+  checkpoint_save_path: "../results"
+  micro_batch_size: 128
+  global_batch_size: 2048
+  seed: 42
+  enable_offload: False
+
+  model:
+    model_name: "openpi"
+    precision: null
+    num_action_chunks: 10
+    action_dim: 7
+    is_lora: False
+    lora_rank: 32
+    gradient_checkpointing: False
+    use_wrist_image: True
+    use_proprio: True
+    num_steps: 10
+    sharding_strategy: "no_shard"
+    add_value_head: True
+    openpi:
+      noise_level: 0.5
+      action_chunk: ${actor.model.num_action_chunks}
+      num_steps: ${actor.model.num_steps}
+      train_expert_only: True
+      action_env_dim: ${actor.model.action_dim}
+      noise_method: "flow_sde"
+      add_value_head: ${actor.model.add_value_head}
+      pi05: True
+      value_after_vlm: False
+      value_vlm_mode: "mean_token"
+
+  optim:
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-05
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    cpu_offload: False
+    offload_pin_memory: False
+    reshard_after_forward: True
+    enable_gradient_accumulation: True
+    forward_prefetch: False
+    limit_all_gathers: False
+    backward_prefetch: null
+    use_orig_params: False
+    use_liger_kernel: False
+    fsdp_size: -1
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+    amp:
+      enabled: False
+      precision: "bf16"
+      use_grad_scaler: False
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

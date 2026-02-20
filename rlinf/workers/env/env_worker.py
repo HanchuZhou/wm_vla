@@ -447,6 +447,7 @@ class EnvWorker(Worker):
                             "type": "reset",
                             "env_rank": self._rank,
                             "stage_id": i,
+                            "hard_reset": True,
                             "images": extracted_obs["images_and_states"]["full_image"],
                             "task_descriptions": extracted_obs.get(
                                 "task_descriptions", None
@@ -486,6 +487,7 @@ class EnvWorker(Worker):
                             "type": "reset",
                             "env_rank": self._rank,
                             "stage_id": i,
+                            "hard_reset": False,
                             "images": self.last_obs_list[i][
                                 "images_and_states"
                             ]["full_image"],

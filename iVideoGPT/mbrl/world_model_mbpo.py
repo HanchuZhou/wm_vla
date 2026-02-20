@@ -11,12 +11,13 @@ import cv2
 import imageio
 import numpy as np
 import torch
-import torch.nn.functional as F
 from dm_env import StepType, specs
 from tqdm import tqdm
 
 from iVideoGPT.mbrl.replay_buffer import (
     ReplayBufferStorage,
+    episode_len,
+    load_episode,
     make_replay_loader,
     make_segment_replay_loader,
 )
@@ -68,7 +69,6 @@ class WorldModelMBPO:
         self.image_size = int(getattr(cfg, "image_size", 64))
         self.action_dim = int(cfg.actor.model.action_dim)
         self.num_action_chunks = int(cfg.actor.model.num_action_chunks)
-        self._target_image_size = self._infer_target_image_size()
         self.state_dim = self._infer_state_dim()
 
         self.env_world_size = env_world_size
@@ -126,6 +126,9 @@ class WorldModelMBPO:
             self._has_demo = len(list(Path(demo_path).glob("*.npz"))) > 0
         else:
             self._has_demo = False
+        self._demo_episode_count, self._demo_transition_count = self._count_demo_pool_stats(
+            demo_path
+        )
 
         self.replay_loader = make_replay_loader(
             buffer_dir,
@@ -151,8 +154,24 @@ class WorldModelMBPO:
             self.cfg.gen_horizon + self.cfg.world_model.context_length,
             demo_path,
             demo_image_size=self.image_size,
+            include_source=True,
         )
         self._seg_replay_iter = None
+
+    @staticmethod
+    def _count_demo_pool_stats(demo_path: Optional[str]) -> tuple[int, int]:
+        if demo_path is None:
+            return 0, 0
+        episode_count = 0
+        transition_count = 0
+        for fn in Path(demo_path).glob("*.npz"):
+            try:
+                episode = load_episode(fn)
+            except Exception:
+                continue
+            episode_count += 1
+            transition_count += int(max(0, episode_len(episode)))
+        return episode_count, transition_count
 
     def _setup_world_model(self) -> None:
         self.video_predictor = VideoPredictor(self.device, self.cfg.world_model)
@@ -273,28 +292,6 @@ class WorldModelMBPO:
             )
         return frame
 
-    def _infer_target_image_size(self) -> tuple[int, int]:
-        env_cfg = getattr(self.cfg, "env", None)
-        train_cfg = getattr(env_cfg, "train", None) if env_cfg is not None else None
-        init_params = (
-            getattr(train_cfg, "init_params", None) if train_cfg is not None else None
-        )
-        height = None
-        width = None
-        if init_params is not None:
-            height = getattr(init_params, "camera_heights", None) or getattr(
-                init_params, "camera_height", None
-            )
-            width = getattr(init_params, "camera_widths", None) or getattr(
-                init_params, "camera_width", None
-            )
-        if height is None or width is None:
-            size = getattr(train_cfg, "image_size", None) if train_cfg is not None else None
-            if size is None:
-                size = self.image_size
-            height = width = size
-        return int(height), int(width)
-
     def _infer_state_dim(self) -> int:
         state_dim = getattr(self.cfg.world_model, "state_dim", None)
         if state_dim is not None:
@@ -343,6 +340,7 @@ class WorldModelMBPO:
         stage_id = int(payload["stage_id"])
         images = payload.get("images")
         task_descs = payload.get("task_descriptions")
+        hard_reset = bool(payload.get("hard_reset", True))
         if task_descs is not None:
             for env_idx, desc in enumerate(task_descs):
                 global_idx = self._global_env_index(env_rank, stage_id, env_idx)
@@ -353,6 +351,8 @@ class WorldModelMBPO:
             images = images.detach().cpu().numpy()
         for env_idx, frame in enumerate(images):
             global_idx = self._global_env_index(env_rank, stage_id, env_idx)
+            if hard_reset:
+                self.replay_storage.close_stream(stream_id=global_idx)
             frame_chw = self._to_chw_uint8(frame)
             self._frame_buffers[global_idx].clear()
             for _ in range(self.frame_stack):
@@ -405,7 +405,7 @@ class WorldModelMBPO:
                     observation=stacked,
                     action=action,
                 )
-                self.replay_storage.add(time_step)
+                self.replay_storage.add(time_step, stream_id=global_idx)
                 transition_count += 1
 
                 if done_flag:
@@ -424,6 +424,18 @@ class WorldModelMBPO:
             self._seg_replay_iter = iter(self.seg_replay_loader)
         return self._seg_replay_iter
 
+    @staticmethod
+    def _split_segment_batch(
+        batch: tuple[Any, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        obs = batch[0]
+        action = batch[1]
+        reward = batch[2]
+        source = batch[3] if len(batch) > 3 else None
+        episode_uid = batch[4] if len(batch) > 4 else None
+        segment_start = batch[5] if len(batch) > 5 else None
+        return obs, action, reward, source, episode_uid, segment_start
+
     def _sample_task_descriptions(self, batch_size: int) -> list[str]:
         pool = [d for d in self._task_desc_per_env if d]
         if not pool:
@@ -441,11 +453,6 @@ class WorldModelMBPO:
             if image.max() <= 1.0:
                 image = image * 255.0
         image = image.float()
-        target_h, target_w = self._target_image_size
-        if image.shape[-2:] != (target_h, target_w):
-            image = F.interpolate(
-                image, size=(target_h, target_w), mode="bilinear", align_corners=False
-            )
         image = image.clamp(0.0, 255.0).to(torch.uint8)
         batch = image.shape[0]
         states = torch.zeros((batch, self.state_dim), dtype=torch.float32)
@@ -576,6 +583,17 @@ class WorldModelMBPO:
         if not self.init_model:
             if self.replay_storage._num_episodes == 0 and not self._has_demo:
                 return metrics
+            print(
+                "[wm_init] replay pool "
+                f"demo_episodes={self._demo_episode_count} "
+                f"demo_transitions={self._demo_transition_count} "
+                f"real_episodes={self.replay_storage._num_episodes} "
+                f"real_transitions={self.replay_storage._num_transitions}"
+            )
+            init_demo_segments = 0
+            init_real_segments = 0
+            init_demo_frames = 0
+            init_real_frames = 0
             init_iter = range(self.cfg.init_update_gen_steps)
             if getattr(self.cfg.world_model, "show_progress", False):
                 init_iter = tqdm(
@@ -586,10 +604,32 @@ class WorldModelMBPO:
                 )
             for _ in init_iter:
                 batch = next(self._get_seg_replay_iter())
+                obs, action, reward, source, _episode_uid, _segment_start = (
+                    self._split_segment_batch(batch)
+                )
                 update_tokenizer = getattr(
                     self.cfg.world_model, "seed_update_tokenizer", True
                 )
-                metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
+                metrics = self.video_predictor.train(
+                    (obs, action, reward),
+                    update_tokenizer=update_tokenizer,
+                )
+                if source is not None:
+                    source_tensor = (
+                        torch.as_tensor(source)
+                        .detach()
+                        .cpu()
+                        .to(torch.long)
+                        .reshape(-1)
+                    )
+                    demo_segments = int((source_tensor > 0).sum().item())
+                    total_segments = int(source_tensor.numel())
+                    real_segments = total_segments - demo_segments
+                    segment_frames = int(obs.shape[1]) if obs.ndim >= 2 else 0
+                    init_demo_segments += demo_segments
+                    init_real_segments += real_segments
+                    init_demo_frames += demo_segments * segment_frames
+                    init_real_frames += real_segments * segment_frames
                 updated = True
                 self.wm_init_update_step += 1
                 if init_step_logger is not None and metrics:
@@ -608,6 +648,45 @@ class WorldModelMBPO:
                 self._mark_generation_replicas_stale()
             output_metrics = {f"wm_init/{k}": v for k, v in metrics.items()}
             output_metrics["wm_init/update_step"] = float(self.wm_init_update_step)
+            output_metrics["wm_init/pool/demo_episodes"] = float(self._demo_episode_count)
+            output_metrics["wm_init/pool/demo_transitions"] = float(
+                self._demo_transition_count
+            )
+            output_metrics["wm_init/pool/real_episodes"] = float(
+                self.replay_storage._num_episodes
+            )
+            output_metrics["wm_init/pool/real_transitions"] = float(
+                self.replay_storage._num_transitions
+            )
+            output_metrics["wm_init/sample/demo_segments"] = float(init_demo_segments)
+            output_metrics["wm_init/sample/real_segments"] = float(init_real_segments)
+            output_metrics["wm_init/sample/demo_frames"] = float(init_demo_frames)
+            output_metrics["wm_init/sample/real_frames"] = float(init_real_frames)
+            total_sample_segments = init_demo_segments + init_real_segments
+            total_sample_frames = init_demo_frames + init_real_frames
+            if total_sample_segments > 0:
+                output_metrics["wm_init/sample/demo_segment_ratio"] = (
+                    init_demo_segments / float(total_sample_segments)
+                )
+            if total_sample_frames > 0:
+                output_metrics["wm_init/sample/demo_frame_ratio"] = (
+                    init_demo_frames / float(total_sample_frames)
+                )
+            print(
+                "[wm_init] sampled "
+                f"demo_segments={init_demo_segments} "
+                f"real_segments={init_real_segments} "
+                f"demo_frames={init_demo_frames} "
+                f"real_frames={init_real_frames}"
+            )
+            if init_step_logger is not None:
+                summary_payload = {
+                    key: value
+                    for key, value in output_metrics.items()
+                    if key.startswith("wm_init/")
+                }
+                if summary_payload:
+                    init_step_logger(summary_payload)
             return output_metrics
 
         if self.cfg.update_gen_every_step > 0 and env_steps % self.cfg.update_gen_every_step == 0:
@@ -623,12 +702,18 @@ class WorldModelMBPO:
                 )
             for _ in update_iter:
                 batch = next(self._get_seg_replay_iter())
+                obs, action, reward, _source, _episode_uid, _segment_start = (
+                    self._split_segment_batch(batch)
+                )
                 update_tokenizer = (
                     env_steps
                     % max(1, (self.cfg.update_tokenizer_every_step // max(1, self.cfg.action_repeat)))
                     == 0
                 )
-                metrics = self.video_predictor.train(batch, update_tokenizer=update_tokenizer)
+                metrics = self.video_predictor.train(
+                    (obs, action, reward),
+                    update_tokenizer=update_tokenizer,
+                )
                 updated = True
             if updated:
                 self._mark_generation_replicas_stale()
@@ -895,14 +980,18 @@ class WorldModelMBPO:
         gif_obs_pred = None
         gif_reward_gt = None
         gif_reward_pred = None
+        gif_segment_start = None
 
         for metric_batch_idx in range(num_metric_batches):
             batch = next(self._get_seg_replay_iter())
-            obs_gt = torch.cat(
-                [batch[0][:, :-2], batch[0][:, 1:-1], batch[0][:, 2:]], dim=2
+            obs, action, reward, source, episode_uid, segment_start = (
+                self._split_segment_batch(batch)
             )
-            action = batch[1][:, 2:]
-            reward_gt = batch[2][:, 2:]
+            obs_gt = torch.cat(
+                [obs[:, :-2], obs[:, 1:-1], obs[:, 2:]], dim=2
+            )
+            action = action[:, 2:]
+            reward_gt = reward[:, 2:]
             policy = lambda obs, step: action[:, step].to(obs.device)
             obs_pred, _, reward_pred = self.video_predictor.rollout(
                 obs_gt[:, 0],
@@ -963,6 +1052,10 @@ class WorldModelMBPO:
                 gif_obs_pred = obs_pred.detach().cpu()
                 gif_reward_gt = reward_gt.detach().cpu()
                 gif_reward_pred = reward_pred.detach().cpu()
+                if segment_start is not None:
+                    gif_segment_start = (
+                        torch.as_tensor(segment_start).detach().cpu().reshape(-1)
+                    )
 
         if action_norm_count > 0:
             action_norm_mean = action_norm_sum / action_norm_count
@@ -982,7 +1075,13 @@ class WorldModelMBPO:
             if gif_obs_gt is not None and gif_obs_pred is not None:
                 gif_count = min(int(num_gifs), int(gif_obs_gt.shape[0]))
                 for i in range(gif_count):
-                    gif_path = gif_dir / f"val-sample-{global_step}-{i}.gif"
+                    segment_tag = -1
+                    if gif_segment_start is not None and i < gif_segment_start.shape[0]:
+                        segment_tag = int(gif_segment_start[i].item())
+                    gif_name = f"val-sample-{global_step}-{i}.gif"
+                    if segment_tag >= 0:
+                        gif_name = f"val-sample-{global_step}-{i}-s{segment_tag}.gif"
+                    gif_path = gif_dir / gif_name
                     frames = []
                     for t in range(gif_obs_gt.shape[1]):
                         frame = (

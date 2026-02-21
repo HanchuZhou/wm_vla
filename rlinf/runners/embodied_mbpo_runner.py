@@ -198,7 +198,13 @@ class EmbodiedMBPORunner:
     def _sync_world_model_policy(self, force: bool = False):
         if self.world_model is None:
             return
-        sync_every = int(self.cfg.world_model.get("sync_every_steps", 1))
+        sync_every_cfg = self.cfg.world_model.get("sync_every_steps", None)
+        if sync_every_cfg is None:
+            sync_every = int(getattr(self.cfg, "update_gen_every_step", 1))
+            if sync_every <= 0:
+                sync_every = 1
+        else:
+            sync_every = int(sync_every_cfg)
         if sync_every <= 0 and not force:
             return
         if not force and sync_every > 1 and (self.global_step % sync_every) != 0:

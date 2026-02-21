@@ -76,11 +76,11 @@ gen_batch: 32
 gen_horizon: 10
 update_gen_every_step: 2
 update_tokenizer_every_step: 2
-update_gen_times: 1
-init_update_gen_steps: 1000
-init_gen_times: 20
+update_gen_times: 3000
+init_update_gen_steps: 3000
+init_gen_times: 10
 real_ratio: 0.5
-start_mbpo: 5
+start_mbpo: 0
 
 world_model:
   enable: true
@@ -207,6 +207,7 @@ rollout:
   unnorm_key: libero_spatial
   enable_offload: False
   pipeline_stage_num: 1
+  sync_every_steps: 1
 
 actor:
   group_name: "ActorGroup"

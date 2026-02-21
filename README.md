@@ -30,15 +30,16 @@ RLinf is a flexible and scalable open-source infrastructure designed for post-tr
 
 ## WM_VLA !!!!
 todo: 
-1. wm make sure the training, generation and validation are in the same episode
 2. train.loss is very high
-3. interpolation
 4. wm fine-tuning matches iVideoGPT paper
 5. wm post-training step maybe too small comparing to warmup. Check if it's trained with new data + demo.
-6. validation jump in wm
 7. try RLinf evaluate pi05-SFT
-8. try pi05_base train without wm
 9. check the ratio of real data and demo in wm warmup
+10. check it is Flow-Noise
+11. try pi_0 training
+12. try longer wm horizon for wm training
+13. exclude wm warmup from steps
+14. use a general script with yaml
 
 
 To start the WM_VLA training:

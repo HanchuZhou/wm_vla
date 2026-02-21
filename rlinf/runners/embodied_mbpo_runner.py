@@ -1,5 +1,6 @@
 import asyncio
 from collections import defaultdict
+import math
 import os
 import time
 from pathlib import Path
@@ -47,7 +48,8 @@ class EmbodiedMBPORunner:
         self.timer = ScopedTimer(reduction="max", sync_cuda=False)
         self.metric_logger = MetricLogger(cfg)
         self.real_env_interactions = 0.0
-        self._wm_init_wandb_history: list[dict[str, float]] = []
+        self._wm_init_wandb_scalars: dict[str, float] = {}
+        self._wm_init_wandb_update_step: float = 0.0
         self._wm_init_wandb_flushed = False
         self._setup_wandb_metric_axes()
 
@@ -126,52 +128,27 @@ class EmbodiedMBPORunner:
         numeric_payload = {}
         for key, value in payload.items():
             numeric_payload[key] = self._safe_to_float(value)
-        self._wm_init_wandb_history.append(numeric_payload)
+        wm_init_step = numeric_payload.get("wm_init/update_step", 0.0)
+        if math.isfinite(wm_init_step):
+            self._wm_init_wandb_update_step = max(
+                self._wm_init_wandb_update_step, wm_init_step
+            )
+        for key, value in numeric_payload.items():
+            if not key.startswith("wm_init/") or key == "wm_init/update_step":
+                continue
+            if not math.isfinite(value):
+                continue
+            self._wm_init_wandb_scalars[key] = float(value)
 
     def _flush_wm_init_wandb_history(self, commit: bool = False) -> None:
-        if self._wm_init_wandb_flushed or not self._wm_init_wandb_history:
+        if self._wm_init_wandb_flushed or not self._wm_init_wandb_scalars:
             return
         wandb = self.metric_logger.logger.get("wandb", None)
         if wandb is None:
             return
-        steps = [
-            int(max(0.0, rec.get("wm_init/update_step", float(idx))))
-            for idx, rec in enumerate(self._wm_init_wandb_history)
-        ]
-        metric_keys = sorted(
-            {
-                key
-                for rec in self._wm_init_wandb_history
-                for key in rec.keys()
-                if key.startswith("wm_init/") and key != "wm_init/update_step"
-            }
-        )
-        if not metric_keys:
-            self._wm_init_wandb_flushed = True
-            return
-
-        columns = ["wm_init/update_step", *metric_keys]
-        table_data = []
-        for idx, rec in enumerate(self._wm_init_wandb_history):
-            row = [steps[idx]]
-            for key in metric_keys:
-                row.append(rec.get(key, float("nan")))
-            table_data.append(row)
-
-        payload = {
-            "wm_init/history": wandb.Table(columns=columns, data=table_data),
-            "global_step": float(self.global_step),
-        }
-        for key in metric_keys:
-            label = key.split("/", 1)[1]
-            values = [rec.get(key, float("nan")) for rec in self._wm_init_wandb_history]
-            payload[f"wm_init/plot/{label}"] = wandb.plot.line_series(
-                xs=steps,
-                ys=[values],
-                keys=[label],
-                title=f"wm_init/{label}",
-                xname="wm_init/update_step",
-            )
+        payload = dict(self._wm_init_wandb_scalars)
+        payload["wm_init/update_step"] = float(self._wm_init_wandb_update_step)
+        payload["global_step"] = float(self.global_step)
         wandb.log(payload, step=int(self.global_step), commit=commit)
         self._wm_init_wandb_flushed = True
 
@@ -229,21 +206,85 @@ class EmbodiedMBPORunner:
         state_dict = self.actor.execute_on(0).get_model_state_dict().wait()[0]
         self.world_model.load_policy_state_dict(state_dict)
 
-    def _drain_wm_channel(self):
+    def _drain_wm_channel(
+        self,
+        target: str = "train",
+        max_target_episodes: Optional[int] = None,
+    ):
         if self.wm_channel is None or self.world_model is None:
             return 0
         drained = 0
+        target_replay = (
+            self.world_model.replay_storage
+            if target == "train"
+            else self.world_model.val_replay_storage
+        )
         key = self.cfg.world_model.channel.queue_name
         while True:
             try:
                 payload = self.wm_channel.get_nowait(key=key)
             except asyncio.QueueEmpty:
                 break
+            if (
+                max_target_episodes is not None
+                and max_target_episodes > 0
+                and target_replay._num_episodes >= max_target_episodes
+            ):
+                continue
             if payload.get("type") == "reset":
-                self.world_model.ingest_reset(payload)
+                self.world_model.ingest_reset(payload, target=target)
             elif payload.get("type") == "step":
-                drained += self.world_model.ingest_step(payload)
+                drained += self.world_model.ingest_step(payload, target=target)
         return drained
+
+    def _run_real_rollout_collection_stage(
+        self,
+        label: str,
+        rollout_calls: int,
+        wm_target: str,
+        wm_max_episodes: Optional[int] = None,
+    ) -> None:
+        if rollout_calls <= 0:
+            return
+        for idx in range(rollout_calls):
+            self.actor.set_global_step(self.global_step)
+            self.rollout.set_global_step(self.global_step)
+            self.update_rollout_weights()
+            print(
+                f"[stage] {label} real rollout start "
+                f"{idx + 1}/{rollout_calls}"
+            )
+            t0 = time.perf_counter()
+            _, real_env_interactions = self.generate_rollouts()
+            t1 = time.perf_counter()
+            drained = float(
+                self._drain_wm_channel(
+                    target=wm_target,
+                    max_target_episodes=wm_max_episodes,
+                )
+            )
+            if drained > 0 and (
+                wm_target == "train"
+                or wm_max_episodes is None
+                or wm_max_episodes <= 0
+            ):
+                real_env_interactions = drained
+            self.real_env_interactions += real_env_interactions
+            self.actor.clear_rollout_batch().wait()
+            print(
+                f"[stage] {label} real rollout end "
+                f"{idx + 1}/{rollout_calls} (duration={t1 - t0:.2f}s)"
+            )
+            if (
+                wm_target == "val"
+                and wm_max_episodes is not None
+                and wm_max_episodes > 0
+                and self.world_model is not None
+                and self.world_model.val_replay_storage._num_episodes >= wm_max_episodes
+            ):
+                break
+        if self.world_model is not None:
+            self.world_model.finalize_replay_streams(target=wm_target)
 
     def _log_wandb_gifs(
         self,
@@ -443,11 +484,26 @@ class EmbodiedMBPORunner:
         wm_gen_total_calls = 0
 
         if self.world_model is not None and not self.world_model.init_model:
+            init_rollout_epoch = int(self.cfg.runner.get("init_rollout_epoch", 5))
+            self._run_real_rollout_collection_stage(
+                label="wm_init_seed",
+                rollout_calls=init_rollout_epoch,
+                wm_target="train",
+            )
+            wm_val_rollout_epoch = int(self.cfg.runner.get("wm_val_rollout_epoch", 1))
+            wm_val_max_episodes = int(self.cfg.runner.get("wm_val_max_episodes", 2048))
+            self._run_real_rollout_collection_stage(
+                label="wm_val_seed",
+                rollout_calls=wm_val_rollout_epoch,
+                wm_target="val",
+                wm_max_episodes=wm_val_max_episodes,
+            )
             print("[stage] world model demo finetuning start")
             t0 = time.perf_counter()
             wm_metrics = self.world_model.maybe_update_world_model(
                 self.global_step,
                 init_step_logger=self._log_wm_init_step_metrics,
+                force_init=True,
             )
             t1 = time.perf_counter()
             duration = t1 - t0
@@ -548,7 +604,7 @@ class EmbodiedMBPORunner:
                         self.global_step,
                         commit=False,
                     )
-                    drained = float(self._drain_wm_channel())
+                    drained = float(self._drain_wm_channel(target="train"))
                     if drained > 0:
                         real_env_interactions = drained
                     self.real_env_interactions += real_env_interactions

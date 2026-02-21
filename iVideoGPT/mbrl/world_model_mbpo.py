@@ -81,6 +81,10 @@ class WorldModelMBPO:
         ]
         self._env_done = [True for _ in range(self.total_envs)]
         self._task_desc_per_env = [""] * self.total_envs
+        self._val_frame_buffers: list[deque] = [
+            deque(maxlen=self.frame_stack) for _ in range(self.total_envs)
+        ]
+        self._val_env_done = [True for _ in range(self.total_envs)]
 
         self.total_env_steps = 0
         self.init_model = False
@@ -157,6 +161,25 @@ class WorldModelMBPO:
             include_source=True,
         )
         self._seg_replay_iter = None
+
+        # Validation-only real trajectories: disjoint from training replay and demos.
+        val_buffer_dir = self.work_dir / "val_buffer"
+        val_buffer_dir.mkdir(parents=True, exist_ok=True)
+        self.val_replay_storage = ReplayBufferStorage(data_specs, val_buffer_dir)
+        self.val_seg_replay_loader = make_segment_replay_loader(
+            val_buffer_dir,
+            int(getattr(self.cfg, "replay_buffer_size", 0)),
+            int(self.cfg.world_model.batch_size),
+            int(getattr(self.cfg, "replay_buffer_num_workers", 1)),
+            bool(getattr(self.cfg, "save_snapshot", True)),
+            int(getattr(self.cfg, "nstep", 1)),
+            float(getattr(self.cfg, "discount", 0.99)),
+            int(self.cfg.gen_horizon + self.cfg.world_model.context_length),
+            demo_path=None,
+            demo_image_size=self.image_size,
+            include_source=False,
+        )
+        self._val_seg_replay_iter = None
 
     @staticmethod
     def _count_demo_pool_stats(demo_path: Optional[str]) -> tuple[int, int]:
@@ -320,28 +343,47 @@ class WorldModelMBPO:
             frame = np.repeat(frame, 3, axis=-1)
         return frame.transpose(2, 0, 1)
 
-    def _ensure_frame_stack(self, env_id: int, frame: np.ndarray) -> None:
-        if not self._frame_buffers[env_id] or self._env_done[env_id]:
-            self._frame_buffers[env_id].clear()
-            for _ in range(self.frame_stack):
-                self._frame_buffers[env_id].append(frame)
-            self._env_done[env_id] = False
-        else:
-            self._frame_buffers[env_id].append(frame)
+    def _resolve_replay_target(
+        self,
+        target: str,
+    ) -> tuple[ReplayBufferStorage, list[deque], list[bool], bool]:
+        if target == "train":
+            return self.replay_storage, self._frame_buffers, self._env_done, True
+        if target == "val":
+            return self.val_replay_storage, self._val_frame_buffers, self._val_env_done, False
+        raise ValueError(f"Unknown replay target: {target}")
 
-    def _stack_frames(self, env_id: int) -> np.ndarray:
-        frames = list(self._frame_buffers[env_id])
+    def _ensure_frame_stack(
+        self,
+        frame_buffers: list[deque],
+        env_done: list[bool],
+        env_id: int,
+        frame: np.ndarray,
+    ) -> None:
+        if not frame_buffers[env_id] or env_done[env_id]:
+            frame_buffers[env_id].clear()
+            for _ in range(self.frame_stack):
+                frame_buffers[env_id].append(frame)
+            env_done[env_id] = False
+        else:
+            frame_buffers[env_id].append(frame)
+
+    def _stack_frames(self, frame_buffers: list[deque], env_id: int) -> np.ndarray:
+        frames = list(frame_buffers[env_id])
         if len(frames) != self.frame_stack:
             raise RuntimeError("Frame stack not initialized")
         return np.concatenate(frames, axis=0)
 
-    def ingest_reset(self, payload: dict[str, Any]) -> None:
+    def ingest_reset(self, payload: dict[str, Any], target: str = "train") -> None:
+        replay_storage, frame_buffers, env_done, update_task_desc = (
+            self._resolve_replay_target(target)
+        )
         env_rank = int(payload["env_rank"])
         stage_id = int(payload["stage_id"])
         images = payload.get("images")
         task_descs = payload.get("task_descriptions")
         hard_reset = bool(payload.get("hard_reset", True))
-        if task_descs is not None:
+        if update_task_desc and task_descs is not None:
             for env_idx, desc in enumerate(task_descs):
                 global_idx = self._global_env_index(env_rank, stage_id, env_idx)
                 self._task_desc_per_env[global_idx] = desc
@@ -352,14 +394,17 @@ class WorldModelMBPO:
         for env_idx, frame in enumerate(images):
             global_idx = self._global_env_index(env_rank, stage_id, env_idx)
             if hard_reset:
-                self.replay_storage.close_stream(stream_id=global_idx)
+                replay_storage.close_stream(stream_id=global_idx)
             frame_chw = self._to_chw_uint8(frame)
-            self._frame_buffers[global_idx].clear()
+            frame_buffers[global_idx].clear()
             for _ in range(self.frame_stack):
-                self._frame_buffers[global_idx].append(frame_chw)
-            self._env_done[global_idx] = False
+                frame_buffers[global_idx].append(frame_chw)
+            env_done[global_idx] = False
 
-    def ingest_step(self, payload: dict[str, Any]) -> int:
+    def ingest_step(self, payload: dict[str, Any], target: str = "train") -> int:
+        replay_storage, frame_buffers, env_done, update_task_desc = (
+            self._resolve_replay_target(target)
+        )
         env_rank = int(payload["env_rank"])
         stage_id = int(payload["stage_id"])
         images = payload["images"]
@@ -377,7 +422,7 @@ class WorldModelMBPO:
         if torch.is_tensor(dones):
             dones = dones.detach().cpu().numpy()
 
-        if task_descs is not None:
+        if update_task_desc and task_descs is not None:
             for env_idx, desc in enumerate(task_descs):
                 global_idx = self._global_env_index(env_rank, stage_id, env_idx)
                 self._task_desc_per_env[global_idx] = desc
@@ -389,8 +434,8 @@ class WorldModelMBPO:
             for step_idx in range(chunk_steps):
                 frame = images[env_idx, step_idx]
                 frame_chw = self._to_chw_uint8(frame)
-                self._ensure_frame_stack(global_idx, frame_chw)
-                stacked = self._stack_frames(global_idx)
+                self._ensure_frame_stack(frame_buffers, env_done, global_idx, frame_chw)
+                stacked = self._stack_frames(frame_buffers, global_idx)
 
                 action = actions[env_idx, step_idx].astype(np.float32)
                 reward = np.array([rewards[env_idx, step_idx]], dtype=np.float32)
@@ -405,13 +450,14 @@ class WorldModelMBPO:
                     observation=stacked,
                     action=action,
                 )
-                self.replay_storage.add(time_step, stream_id=global_idx)
+                replay_storage.add(time_step, stream_id=global_idx)
                 transition_count += 1
 
                 if done_flag:
-                    self._env_done[global_idx] = True
-                    self._frame_buffers[global_idx].clear()
-        self.total_env_steps += transition_count
+                    env_done[global_idx] = True
+                    frame_buffers[global_idx].clear()
+        if target == "train":
+            self.total_env_steps += transition_count
         return transition_count
 
     def _get_replay_iter(self):
@@ -423,6 +469,18 @@ class WorldModelMBPO:
         if self._seg_replay_iter is None:
             self._seg_replay_iter = iter(self.seg_replay_loader)
         return self._seg_replay_iter
+
+    def _get_val_seg_replay_iter(self):
+        if self._val_seg_replay_iter is None:
+            self._val_seg_replay_iter = iter(self.val_seg_replay_loader)
+        return self._val_seg_replay_iter
+
+    def finalize_replay_streams(self, target: str = "train") -> None:
+        replay_storage, frame_buffers, env_done, _ = self._resolve_replay_target(target)
+        replay_storage.close_all_streams()
+        for idx in range(len(frame_buffers)):
+            frame_buffers[idx].clear()
+            env_done[idx] = True
 
     @staticmethod
     def _split_segment_batch(
@@ -574,10 +632,13 @@ class WorldModelMBPO:
         self,
         env_steps: int,
         init_step_logger: Optional[Callable[[dict[str, float]], None]] = None,
+        force_init: bool = False,
     ) -> dict[str, float]:
         metrics = {}
         updated = False
-        if env_steps < self.cfg.num_seed_frames:
+        if env_steps < self.cfg.num_seed_frames and not (
+            force_init and not self.init_model
+        ):
             return metrics
 
         if not self.init_model:
@@ -957,8 +1018,8 @@ class WorldModelMBPO:
         fps: int = 4,
         num_metric_batches: int = 1,
     ) -> dict[str, float]:
-        if self.replay_storage._num_episodes == 0 and not self._has_demo:
-            print("[stage] world model validate skipped (empty replay buffer and no demos)")
+        if self.val_replay_storage._num_episodes == 0:
+            print("[stage] world model validate skipped (empty validation replay buffer)")
             return {}
 
         num_metric_batches = max(1, int(num_metric_batches))
@@ -983,7 +1044,7 @@ class WorldModelMBPO:
         gif_segment_start = None
 
         for metric_batch_idx in range(num_metric_batches):
-            batch = next(self._get_seg_replay_iter())
+            batch = next(self._get_val_seg_replay_iter())
             obs, action, reward, source, episode_uid, segment_start = (
                 self._split_segment_batch(batch)
             )

@@ -116,6 +116,10 @@ class ReplayBufferStorage:
     def close_stream(self, stream_id: Hashable = 0):
         return self._finalize_stream(stream_id, force_terminal=True)
 
+    def close_all_streams(self):
+        for stream_id in list(self._current_episodes.keys()):
+            self._finalize_stream(stream_id, force_terminal=True)
+
     def _preload(self):
         self._num_episodes = 0
         self._num_transitions = 0
